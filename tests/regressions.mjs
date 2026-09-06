@@ -703,6 +703,107 @@ await t("9e. отказ API по уровню усилий объясняетс�
   assert.match(flag, /Update the plugin|Обнови плагин/, "совет должен начинаться с обновления плагина");
 });
 
+// ─────────── 9f–9j. Каталог реальной формы (найдено на codex-cli 0.153.4)
+
+// Форма записи, которую Codex действительно отдаёт: ключ модели — slug, уровни
+// усилий лежат в supported_reasoning_levels массивом объектов, а внутри записи
+// есть service_tiers — набор объектов с id и name, но это не модели.
+const LIVE_ENTRY = {
+  slug: "gpt-5.6-sol",
+  display_name: "GPT-5.6-Sol",
+  description: "Our most capable model.",
+  default_reasoning_level: "low",
+  supported_reasoning_levels: [
+    { effort: "low", description: "Fast responses" },
+    { effort: "high", description: "Greater depth" },
+    { effort: "ultra", description: "Maximum depth" },
+  ],
+  visibility: "list",
+  service_tiers: [{ id: "priority", name: "Fast", description: "1.5x speed, increased usage" }],
+};
+
+await t("9f. уровни усилий читаются из supported_reasoning_levels", async () => {
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?live=${Date.now()}`);
+  const parsed = m.parseCatalog({ models: [LIVE_ENTRY] });
+  const sol = parsed.find((x) => x.id === "gpt-5.6-sol");
+  assert.ok(sol, `модель не разобрана: ${JSON.stringify(parsed)}`);
+  assert.deepEqual(sol.efforts, ["low", "high", "ultra"], "уровни усилий не прочитаны");
+});
+
+await t("9g. service_tiers внутри модели не становится моделью", async () => {
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?tiers=${Date.now()}`);
+  const ids = m.parseCatalog({ models: [LIVE_ENTRY] }).map((x) => x.id);
+  assert.deepEqual(ids, ["gpt-5.6-sol"], `в каталог попали посторонние записи: ${ids.join(", ")}`);
+});
+
+await t("9h. пустой список моделей не подменяется обходом дерева", async () => {
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?empty=${Date.now()}`);
+  const ids = m.parseCatalog({ models: [], service_tiers: [{ id: "priority", name: "Fast" }] }).map((x) => x.id);
+  assert.deepEqual(ids, [], `явно пустой каталог дополнен: ${ids.join(", ")}`);
+});
+
+await t("9i. модель, которой нет в полном каталоге, не блокируется", async () => {
+  const d = fresh("catalog-miss");
+  process.env.CLAUDE_PLUGIN_DATA = d;
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?miss=${Date.now()}`);
+  fs.writeFileSync(
+    path.join(d, "models-cache.json"),
+    JSON.stringify({
+      v: m.CACHE_VERSION,
+      at: Date.now(),
+      source: "codex debug models",
+      complete: true,
+      models: [{ id: "gpt-5.6-sol", label: "Sol", efforts: ["low"] }],
+    })
+  );
+  // Каталог отстаёт от реальной доступности: gpt-6-astra работал в codex exec,
+  // когда debug models его ещё не перечислял. Решает API, а не каталог.
+  const k = m.knownModel("gpt-6-astra");
+  assert.equal(k.known, true, "рабочая модель отклонена по каталогу");
+  assert.equal(k.unverified, true, "пропуск не помечен как непроверенный");
+});
+
+await t("9j. кэш прежнего формата не используется", async () => {
+  const d = fresh("catalog-oldcache");
+  process.env.CLAUDE_PLUGIN_DATA = d;
+  process.env.CODEX_BIN = path.join(d, "no-such-codex");
+  fs.writeFileSync(
+    path.join(d, "models-cache.json"),
+    // Записан до исправления разбора: efforts потеряны, есть фантомный service tier.
+    JSON.stringify({
+      at: Date.now(),
+      source: "codex debug models",
+      complete: true,
+      models: [{ id: "priority", label: "Fast", efforts: null }],
+    })
+  );
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?oldcache=${Date.now()}`);
+  const r = m.fetchModels();
+  assert.ok(
+    !r.models?.some((x) => x.id === "priority"),
+    "кэш прежнего формата отдан как есть"
+  );
+  delete process.env.CODEX_BIN;
+});
+
+await t("9k. уровень из каталога не режется зашитым списком", async () => {
+  const d = fresh("catalog-ultra");
+  process.env.CLAUDE_PLUGIN_DATA = d;
+  const m = await import(`${ROOT_URL}/scripts/models.mjs?ultra=${Date.now()}`);
+  fs.writeFileSync(
+    path.join(d, "models-cache.json"),
+    JSON.stringify({
+      v: m.CACHE_VERSION,
+      at: Date.now(),
+      source: "codex debug models",
+      complete: true,
+      models: [{ id: "gpt-5.6-sol", label: "Sol", efforts: ["low", "high", "ultra"] }],
+    })
+  );
+  assert.equal(m.validateEffort("gpt-5.6-sol", "ultra"), null, "ultra отклонён, хотя каталог его объявляет");
+  assert.ok(m.effortLevels().includes("ultra"), "ultra не попал в схему инструментов");
+});
+
 // ───────────────── 14. Нераскрытые плейсхолдеры (найдено при первом запуске)
 
 await t("14a. литеральный ${CLAUDE_PLUGIN_DATA} не создаёт каталог в проекте", async () => {
