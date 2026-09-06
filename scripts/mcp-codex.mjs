@@ -26,7 +26,7 @@ import {
 } from "./codex-core.mjs";
 import { appServerReviewTarget } from "./app-server.mjs";
 import { normalize, askedLine } from "./codex-events.mjs";
-import { fetchModels, formatModels, knownModel, validateEffort, EFFORT_LEVELS } from "./models.mjs";
+import { fetchModels, formatModels, knownModel, validateEffort, effortLevels } from "./models.mjs";
 import { readChat, writeChat, listChats, deleteChat, withChatLock, isValidSlug } from "./chat-store.mjs";
 import { readPrefs, writePrefs } from "./prefs.mjs";
 import { toolText, uiText } from "./i18n.mjs";
@@ -35,6 +35,10 @@ const T = toolText();
 // Ответы берутся на каждый вызов: язык задаётся окружением процесса.
 const U = uiText;
 const EFFORT_DESC = T.effort;
+// Набор уровней берётся из каталога Codex, а не только из зашитой основы:
+// иначе новый уровень (ultra) не доходит до вызывающего. Схема строится один
+// раз при старте, поэтому набор читается из кэша, без запуска codex.
+const EFFORT_SET = effortLevels();
 
 const TOOLS = [
   {
@@ -47,7 +51,7 @@ const TOOLS = [
         context: { type: "string", description: T.ask_context },
         model: { type: "string", description: T.ask_model },
         wait_seconds: { type: "number", default: 90, description: T.ask_wait },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
       required: ["question"],
     },
@@ -61,7 +65,7 @@ const TOOLS = [
         message: { type: "string", description: T.chat_message },
         chat: { type: "string", description: T.chat_chat },
         model: { type: "string", description: T.chat_model },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         context: { type: "string", description: T.chat_context },
         write: { type: "boolean", default: false, description: T.chat_write },
         wait_seconds: { type: "number", default: 120, description: T.chat_wait },
@@ -86,7 +90,7 @@ const TOOLS = [
       type: "object",
       properties: {
         model: { type: "string", description: T.use_model },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         clear: { type: "boolean", description: T.use_clear },
       },
     },
@@ -101,7 +105,7 @@ const TOOLS = [
         focus: { type: "string", description: T.review_focus },
         background: { type: "boolean", default: true },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
     },
   },
@@ -115,7 +119,7 @@ const TOOLS = [
         base: { type: "string", description: T.review_base },
         background: { type: "boolean", default: true },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
     },
   },
@@ -127,7 +131,7 @@ const TOOLS = [
       properties: {
         task: { type: "string", description: T.delegate_task },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         wait_seconds: { type: "number", default: 120, description: T.delegate_wait },
       },
       required: ["task"],
@@ -315,8 +319,10 @@ async function dispatchTool(name, args, ctx = {}) {
   }
 
   if (args.model) {
+    // Каталог отстаёт от реальной доступности, поэтому он предупреждает, а не
+    // запрещает: отказ по каталогу однажды заблокировал уже работавшую модель.
     const k = knownModel(args.model);
-    if (!k.known) return err(U().unknown_model(args.model, k.available.join(", ")));
+    if (k.unverified && k.available?.length) ctx?.notify?.(U().model_unverified(args.model, k.available.join(", ")));
   }
 
   // Лента открывается вопросом, а не первым действием Codex: иначе в клиенте

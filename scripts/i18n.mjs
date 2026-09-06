@@ -341,8 +341,9 @@ const UI = {
     answer_header: "GPT answer:",
 
     effort_hint: (bad) => `${bad}\nFull list — the codex_models tool.`,
-    unknown_model: (model, available) =>
-      `Model "${model}" is not in the Codex catalogue.\nAvailable: ${available}\nFull list with descriptions — the codex_models tool.`,
+    model_unverified: (model, available) =>
+      `Model "${model}" is not in the Codex catalogue — running it anyway, Codex has the final say. ` +
+      `Listed: ${available}\nIf the name is wrong, the call will fail with an API error. Refresh the list — the codex_models tool.`,
 
     cancelled: (id) => `Call cancelled, task ${id} stopped.`,
     cancelled_chat: (id, slug) => `Call cancelled, task ${id} stopped. Thread "${slug}" left unchanged.`,
@@ -416,8 +417,9 @@ const UI = {
     answer_header: "Ответ GPT:",
 
     effort_hint: (bad) => `${bad}\nПолный список — инструмент codex_models.`,
-    unknown_model: (model, available) =>
-      `Модель "${model}" отсутствует в каталоге Codex.\nДоступны: ${available}\nПолный список с описаниями — инструмент codex_models.`,
+    model_unverified: (model, available) =>
+      `Модель "${model}" отсутствует в каталоге Codex — вызываю всё равно, решает сам Codex. ` +
+      `В каталоге: ${available}\nЕсли имя ошибочно, вызов упадёт ошибкой API. Обновить список — инструмент codex_models.`,
 
     cancelled: (id) => `Вызов отменён, задача ${id} остановлена.`,
     cancelled_chat: (id, slug) => `Вызов отменён, задача ${id} остановлена. Тред "${slug}" не изменён.`,

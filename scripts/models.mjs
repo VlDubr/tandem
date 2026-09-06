@@ -11,50 +11,102 @@ import { codexBinary, dataDir, envClean } from "./codex-core.mjs";
 import { message } from "./i18n-runtime.mjs";
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 часов
+// Формат разобранной записи. Повышается вместе с разбором каталога: иначе после
+// исправления парсера кэш ещё шесть часов отдавал бы прежние ошибки.
+export const CACHE_VERSION = 2;
 const cachePath = () => path.join(path.dirname(dataDir()), "models-cache.json");
 
-/** Вытаскивает записи моделей из произвольной формы JSON-каталога. */
-export function parseCatalog(payload) {
+/**
+ * Уровни усилий записи. Codex отдаёт их в supported_reasoning_levels массивом
+ * объектов {effort, description}; прежние имена полей оставлены как запасные.
+ * Отсутствие поля означает «неизвестно», а не «модель не принимает ничего».
+ */
+function readEfforts(node) {
+  const raw =
+    node?.supported_reasoning_levels || node?.supported_reasoning_efforts || node?.reasoning_efforts || node?.efforts;
+  if (!Array.isArray(raw)) return null;
   const out = [];
-  const seen = new Set();
+  for (const item of raw) {
+    const v = typeof item === "string" ? item : item?.effort || item?.level || item?.id;
+    if (typeof v === "string" && v && !out.includes(v)) out.push(v);
+  }
+  return out.length ? out : null;
+}
 
-  const push = (id, node) => {
-    if (!id || typeof id !== "string" || seen.has(id)) return;
-    seen.add(id);
-    out.push({
-      id,
-      label: node?.display_name || node?.label || node?.name || null,
-      efforts: node?.supported_reasoning_efforts || node?.reasoning_efforts || node?.efforts || null,
-      visibility: node?.visibility || null,
-      default: node?.is_default === true || node?.default === true || undefined,
-    });
+function toEntry(node, key) {
+  const id = node?.slug || node?.id || node?.model || node?.model_id || key;
+  if (!id || typeof id !== "string") return null;
+  return {
+    id,
+    label: node?.display_name || node?.label || node?.name || null,
+    efforts: readEfforts(node),
+    visibility: node?.visibility || null,
+    default: node?.is_default === true || node?.default === true || undefined,
   };
+}
 
+/** Похоже ли на запись модели. Одного `name` мало: его носят и service_tiers. */
+function looksLikeModel(n) {
+  if (!n || typeof n !== "object" || Array.isArray(n)) return false;
+  return Boolean(
+    n.display_name ||
+      n.label ||
+      n.visibility ||
+      Array.isArray(n.supported_reasoning_levels) ||
+      Array.isArray(n.supported_reasoning_efforts) ||
+      Array.isArray(n.reasoning_efforts) ||
+      Array.isArray(n.efforts)
+  );
+}
+
+/** Запасной разбор для форм без явного списка: форма вывода не документирована. */
+function walkCatalog(payload) {
+  const out = [];
   const walk = (node) => {
     if (!node || typeof node !== "object") return;
     if (Array.isArray(node)) return node.forEach(walk);
 
-    const id = node.id || node.slug || node.model || node.model_id;
-    // Отличаем запись модели от произвольного объекта с полем id
-    if (typeof id === "string" && (node.display_name || node.label || node.name || node.slug || node.visibility)) {
-      push(id, node);
+    const id = node.slug || node.id || node.model || node.model_id;
+    if (typeof id === "string" && looksLikeModel(node)) {
+      const e = toEntry(node);
+      if (e) out.push(e);
+      return; // внутрь записи не спускаемся: там лежат service_tiers и прочее
     }
     for (const [k, v] of Object.entries(node)) {
       // Каталоги часто выглядят как { "gpt-5.6-sol": {...} }
-      if (v && typeof v === "object" && !Array.isArray(v) && /^[a-z0-9][\w.\-]*$/i.test(k) && (v.display_name || v.label || v.supported_reasoning_efforts || v.visibility)) {
-        push(k, v);
+      if (looksLikeModel(v) && /^[a-z0-9][\w.\-]*$/i.test(k)) {
+        const e = toEntry(v, k);
+        if (e) out.push(e);
+        continue;
       }
       walk(v);
     }
   };
-
   walk(payload);
+  return out;
+}
+
+/** Вытаскивает записи моделей из JSON-каталога. */
+export function parseCatalog(payload) {
+  // Явный список — единственный источник, когда он есть: прежний сплошной обход
+  // принимал за модели вложенные объекты записи (service_tiers → «priority»).
+  const list = Array.isArray(payload) ? payload : Array.isArray(payload?.models) ? payload.models : null;
+  const entries = list ? list.map((n) => toEntry(n)).filter(Boolean) : walkCatalog(payload);
+
+  const out = [];
+  const seen = new Set();
+  for (const e of entries) {
+    if (seen.has(e.id)) continue;
+    seen.add(e.id);
+    out.push(e);
+  }
   return out;
 }
 
 function readCache() {
   try {
     const c = JSON.parse(fs.readFileSync(cachePath(), "utf8"));
+    if (c.v !== CACHE_VERSION) return null;
     if (Date.now() - c.at < CACHE_TTL_MS && Array.isArray(c.models) && c.models.length) return c;
   } catch {}
   return null;
@@ -63,9 +115,11 @@ function readCache() {
 function writeCache(models, source, complete) {
   try {
     fs.mkdirSync(path.dirname(cachePath()), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(cachePath(), JSON.stringify({ at: Date.now(), source, complete, models }, null, 2), {
-      mode: 0o600,
-    });
+    fs.writeFileSync(
+      cachePath(),
+      JSON.stringify({ v: CACHE_VERSION, at: Date.now(), source, complete, models }, null, 2),
+      { mode: 0o600 }
+    );
   } catch {}
 }
 
@@ -134,7 +188,9 @@ export function fetchModels({ force = false } = {}) {
       ok: true,
       models: stale.models,
       source: message("models_stale_source", stale.source),
-      complete: stale.complete !== false,
+      // Просроченный кэш — подсказка, а не каталог: он мог быть записан прежним
+      // разбором и заведомо не знает моделей, появившихся после его записи.
+      complete: false,
       degraded: true,
     };
   }
@@ -166,26 +222,42 @@ export function modelsFromConfig() {
   return [...found.values()];
 }
 
-/** Есть ли такая модель в каталоге. Неизвестный каталог => не блокируем. */
+/**
+ * Есть ли такая модель в каталоге — как справка, а не как разрешение.
+ * Каталог отстаёт от реальной доступности: gpt-6-astra отвечал в `codex exec`,
+ * когда `codex debug models` его ещё не перечислял, а кэш держал прежний список
+ * ещё шесть часов. Поэтому вызов не блокируется — последнее слово за API.
+ */
 export function knownModel(id) {
   if (!id) return { known: true };
   const r = fetchModels();
   if (!r.ok) return { known: true, unverified: true };
   const hit = r.models.find((m) => m.id === id);
   if (hit) return { known: true, model: hit };
-  // Каталог неполный (получен обходным путём) — запрещать по нему нельзя:
-  // отклонили бы вполне рабочую модель. Пропускаем с пометкой.
-  if (r.complete === false) return { known: true, unverified: true, source: r.source };
-  return { known: false, available: r.models.map((m) => m.id) };
+  return { known: true, unverified: true, source: r.source, available: r.models.map((m) => m.id) };
 }
 
 /**
- * Все уровни усилий, встречающиеся в линейке. Конкретная модель принимает лишь
- * подмножество: gpt-5.6-sol отвергает `minimal` ошибкой API, а модели прошлых
- * поколений его принимают. Поэтому список здесь широкий — он нужен только для
- * схемы MCP-инструмента, а настоящую фильтрацию делает каталог модели.
+ * Основа набора уровней усилий: то, что известно и без каталога. Конкретная
+ * модель принимает лишь подмножество — gpt-5.6-sol отвергает `minimal` ошибкой
+ * API, а модели прошлых поколений его принимают. Настоящую фильтрацию делает
+ * каталог модели, см. effortsFor.
  */
 export const EFFORT_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Набор для схемы MCP-инструментов и для проверки: основа плюс всё, что объявил
+ * каталог. Иначе новый уровень (`ultra` у gpt-5.6-sol) остаётся недоступным,
+ * пока его не впишут руками. Берётся только из кэша: построение схемы не должно
+ * стоить вызова `codex debug models` на старте сервера.
+ */
+export function effortLevels() {
+  const out = [...EFFORT_LEVELS];
+  for (const m of readCache()?.models || []) {
+    for (const e of m.efforts || []) if (!out.includes(e)) out.push(e);
+  }
+  return out;
+}
 
 /** Уровни, поддерживаемые конкретной моделью, или null если неизвестно. */
 export function effortsFor(id) {
@@ -203,8 +275,11 @@ export function effortsFor(id) {
  */
 export function validateEffort(model, effort) {
   if (!effort) return null;
-  if (!EFFORT_LEVELS.includes(effort)) {
-    return message("effort_unknown", effort, EFFORT_LEVELS);
+  // Тот же набор, что объявлен в схеме инструмента: расходись они, вызывающий
+  // получал бы отказ на значение, которое схема ему разрешает.
+  const levels = effortLevels();
+  if (!levels.includes(effort)) {
+    return message("effort_unknown", effort, levels);
   }
   const supported = effortsFor(model || envClean("TANDEM_MODEL"));
   if (supported && !supported.includes(effort)) {
