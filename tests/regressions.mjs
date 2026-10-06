@@ -2784,6 +2784,15 @@ await t("32k. без промпта нативное ревью не подме�
   assert.equal(fallbacks, 0, "после отправки review/start запущен второй расход квоты");
 });
 
+await t("33. совместные сессии и оба MCP-моста", () => {
+  const r = spawnSync(process.execPath, [
+    "--test",
+    path.join(ROOT, "tests", "collaboration.mjs"),
+    path.join(ROOT, "tests", "collaboration-bridges.mjs"),
+  ], { encoding: "utf8", timeout: 120_000, maxBuffer: 4 * 1024 * 1024 });
+  assert.equal(r.status, 0, r.error?.message || `${r.stdout}\n${r.stderr}`);
+});
+
 // ───────────────────────────────── отчёт
 
 const failed = results.filter((r) => !r.ok);

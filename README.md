@@ -128,6 +128,26 @@ An honest limitation: a plugin cannot add Codex models to Claude Code's `/model`
 
 `/tandem:debate` runs a structured argument over several rounds: Claude states a position, GPT challenges it, Claude answers the strongest objection. It closes with what both sides accepted, where they still disagree, and which experiment would settle it. Agreement is never faked: two diverging opinions are more useful than one averaged out.
 
+### Research, brainstorming, comparison, and custom collaboration
+
+```text
+/tandem:research --session cache compare caching strategies for this project
+/tandem:brainstorm --session onboarding find ways to simplify onboarding
+/tandem:custom --session migration ask GPT to independently assess migration risks
+/tandem:compare --session parser --max-tokens 200000 find the bug in the date parser
+/tandem:research --session cache --continue investigate the unresolved consistency trade-off
+```
+
+The primary model in your IDE coordinates the dialogue and contributes its own analysis. There is no autonomous model-to-model background loop. Research develops and checks hypotheses; brainstorming separates independent idea generation from evaluation and synthesis; custom collaboration lets the primary model formulate questions or bounded read-only assignments itself. Comparison makes the primary model commit its own finished answer before calling GPT; GPT solves independently without seeing it, then both answers are compared on correctness, completeness, risks, and verifiability. The commitment is accepted once per stage, so it cannot be revised after seeing GPT's answer. Intermediate contributions are labelled by model; the final answer preserves unresolved disagreements.
+
+Both directions use the same protocol: `codex_collaborate` and `claude_collaborate`. Each named session has **six second-model calls per stage**, including failures and cancellations. A successful synthesis closes the stage early. Continuing requires `action: "extend"`, a summary, and `confirm: true` after an explicit user request. The server enforces the stage limit, but the confirmation is the caller's attestation, not authenticated human approval. Optionally, `max_tokens` sets a soft token budget for the whole session. Real usage is taken from both CLIs (cached input excluded); when a CLI reports nothing, usage is estimated and flagged as such. The budget is checked before each turn, so the last turn may exceed it; continuing requires `extend` with a larger `max_tokens`.
+
+`action: "list"` shows this workspace's sessions; `action: "forget"` with `confirm: true` deletes a session's local transcript. Sessions survive bridge restarts. `action: "status"` returns the current state and collects an outstanding Codex result without repeating the request; `action: "cancel"` cancels the outstanding round. Claude calls wait for completion; Codex may return `pending` with a job ID. The host must poll that job, not submit a replacement. Extending supplies the summary and the new stage to the second model; the full earlier transcript remains local. Replies over 16,000 characters are explicitly marked as truncated, with their complete text in `state_file`.
+
+These sessions **never grant write access**. Use the existing separate delegation workflow, with permission, for file changes. Claude has only Read/Grep/Glob; Codex uses a read-only sandbox with configured MCP servers disabled. Recursive bridge calls are blocked. Codex collaboration refuses `bypass_sandbox`: repair the sandbox and turn bypass off rather than silently removing isolation. Web access and arbitrary external MCP tools are not promised by this mode; the primary model can supply verified sources.
+
+Transcripts are stored outside the repository under the plugin data directory's `collaborations` folder, scoped to the canonical working directory and the second-model backend. They contain prompts and replies and have no automatic expiration. Do not include credentials or sensitive material; read-only access is not a secrecy filter. Existing `/tandem:chat`, `/tandem:ask`, `/tandem:debate`, and delegation retain their behavior.
+
 ### Image generation
 
 ```
@@ -142,6 +162,7 @@ Rendered by gpt-image-2 through Codex's built-in tool — on your ChatGPT subscr
 After `/tandem:setup --link-back`, GPT gets tools of its own:
 
 - **`claude_ask`, `claude_critique`** — ask Claude's opinion, have it critique a plan before you apply it
+- **`claude_collaborate`** — persistent research, brainstorming, comparison, or custom read-only work, coordinated by GPT
 - **`claude_task`** — hand a task to Claude Code with all of its tools
 - **MCP proxying** — tools from your MCP servers (issue tracker, database, docs) become directly available to GPT
 
@@ -255,6 +276,10 @@ Only what you list is proxied. A tool left out of `--tools` simply does not exis
 | `/tandem:chat [--model M] [--chat name] [--write] <message>` | A conversation with a Codex model; the thread remembers earlier turns |
 | `/tandem:use [model] [--effort level]` | Default Codex model for this repository |
 | `/tandem:debate <topic>` | Multi-round Claude ↔ GPT argument |
+| `/tandem:research [--session name] [--continue] <topic>` | Joint research with persistent stages and evidence-based synthesis |
+| `/tandem:brainstorm [--session name] [--continue] <problem>` | Generate ideas independently, evaluate them, and choose a solution |
+| `/tandem:custom [--session name] [--continue] <goal>` | The primary model chooses questions or read-only assignments for the second model |
+| `/tandem:compare [--session name] [--max-tokens N] [--continue] <task>` | Both models solve independently; then a structured comparison and verdict |
 | `/tandem:image <description>` | gpt-image-2 image with result verification |
 | `/tandem:models [--refresh]` | Models actually available in this Codex |
 | `/tandem:setup [flags]` | Diagnostics, reverse bridge, tool proxying |
