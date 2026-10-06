@@ -177,6 +177,7 @@ function runExec() {
 
   child = spawn(spec.bin, spec.args, {
     cwd: spec.cwd || process.cwd(),
+    env: spec.collaborationChild ? { ...process.env, TANDEM_COLLABORATION_CHILD: "1" } : process.env,
     stdio: ["pipe", "pipe", "pipe"],
     detached: process.platform !== "win32",
     windowsHide: true,

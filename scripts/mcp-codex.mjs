@@ -23,20 +23,29 @@ import {
   reviewBackend,
   repoKey,
   buildPrompt,
+  bypassSandboxEnabled,
 } from "./codex-core.mjs";
 import { appServerReviewTarget } from "./app-server.mjs";
 import { normalize, askedLine } from "./codex-events.mjs";
-import { fetchModels, formatModels, knownModel, validateEffort, EFFORT_LEVELS } from "./models.mjs";
+import { fetchModels, formatModels, knownModel, validateEffort, effortLevels } from "./models.mjs";
 import { readChat, writeChat, listChats, deleteChat, withChatLock, isValidSlug } from "./chat-store.mjs";
 import { readPrefs, writePrefs } from "./prefs.mjs";
 import { toolText, uiText } from "./i18n.mjs";
+import { CollaborationSession, collaborationTool } from "./collaboration.mjs";
+import { createCodexCollaborationRunner } from "./collaboration-codex.mjs";
+import { collaborationMessage } from "./i18n-collaboration.mjs";
 
 const T = toolText();
 // Ответы берутся на каждый вызов: язык задаётся окружением процесса.
 const U = uiText;
 const EFFORT_DESC = T.effort;
+// Набор уровней берётся из каталога Codex, а не только из зашитой основы:
+// иначе новый уровень (ultra) не доходит до вызывающего. Схема строится один
+// раз при старте, поэтому набор читается из кэша, без запуска codex.
+const EFFORT_SET = effortLevels();
 
 const TOOLS = [
+  collaborationTool("codex", { efforts: EFFORT_SET }),
   {
     name: "codex_ask",
     description: T.ask_d,
@@ -47,7 +56,7 @@ const TOOLS = [
         context: { type: "string", description: T.ask_context },
         model: { type: "string", description: T.ask_model },
         wait_seconds: { type: "number", default: 90, description: T.ask_wait },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
       required: ["question"],
     },
@@ -61,7 +70,7 @@ const TOOLS = [
         message: { type: "string", description: T.chat_message },
         chat: { type: "string", description: T.chat_chat },
         model: { type: "string", description: T.chat_model },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         context: { type: "string", description: T.chat_context },
         write: { type: "boolean", default: false, description: T.chat_write },
         wait_seconds: { type: "number", default: 120, description: T.chat_wait },
@@ -86,7 +95,7 @@ const TOOLS = [
       type: "object",
       properties: {
         model: { type: "string", description: T.use_model },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         clear: { type: "boolean", description: T.use_clear },
       },
     },
@@ -101,7 +110,7 @@ const TOOLS = [
         focus: { type: "string", description: T.review_focus },
         background: { type: "boolean", default: true },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
     },
   },
@@ -115,7 +124,7 @@ const TOOLS = [
         base: { type: "string", description: T.review_base },
         background: { type: "boolean", default: true },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
       },
     },
   },
@@ -127,7 +136,7 @@ const TOOLS = [
       properties: {
         task: { type: "string", description: T.delegate_task },
         model: { type: "string" },
-        effort: { type: "string", enum: EFFORT_LEVELS, description: EFFORT_DESC },
+        effort: { type: "string", enum: EFFORT_SET, description: EFFORT_DESC },
         wait_seconds: { type: "number", default: 120, description: T.delegate_wait },
       },
       required: ["task"],
@@ -303,7 +312,8 @@ async function handleTool(name, args, ctx = {}) {
 }
 
 async function dispatchTool(name, args, ctx = {}) {
-  if (CLI_TOOLS.has(name)) {
+  if (process.env.TANDEM_COLLABORATION_CHILD === "1") return err(collaborationMessage("nested"));
+  if (CLI_TOOLS.has(name) || (name === "codex_collaborate" && (!args.action || args.action === "turn"))) {
     const problem = await guard();
     if (problem) return err(problem);
   }
@@ -315,8 +325,10 @@ async function dispatchTool(name, args, ctx = {}) {
   }
 
   if (args.model) {
+    // Каталог отстаёт от реальной доступности, поэтому он предупреждает, а не
+    // запрещает: отказ по каталогу однажды заблокировал уже работавшую модель.
     const k = knownModel(args.model);
-    if (!k.known) return err(U().unknown_model(args.model, k.available.join(", ")));
+    if (k.unverified && k.available?.length) ctx?.notify?.(U().model_unverified(args.model, k.available.join(", ")));
   }
 
   // Лента открывается вопросом, а не первым действием Codex: иначе в клиенте
@@ -325,6 +337,23 @@ async function dispatchTool(name, args, ctx = {}) {
   if (asked) ctx?.notify?.(asked);
 
   switch (name) {
+    case "codex_collaborate": {
+      if ((!args.action || args.action === "turn") && bypassSandboxEnabled()) {
+        return err(collaborationMessage("bypass"));
+      }
+      const runner = createCodexCollaborationRunner(cwd, notifier(ctx));
+      const preferences = applyDefaults({}, cwd);
+      const defaults = {
+        model: preferences.model || envClean("TANDEM_MODEL"),
+        effort: preferences.effort || envClean("TANDEM_EFFORT"),
+      };
+      try {
+        const session = new CollaborationSession({ backend: "codex", cwd, runner, defaults });
+        return text(JSON.stringify(await session.handle(args, ctx), null, 2));
+      } catch (error) {
+        return err(error.message || String(error));
+      }
+    }
     case "codex_ask": {
       const waitMs = Math.max(10, Number(args.wait_seconds) || 90) * 1000;
       const r = await runJob(
