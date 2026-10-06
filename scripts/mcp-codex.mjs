@@ -23,6 +23,7 @@ import {
   reviewBackend,
   repoKey,
   buildPrompt,
+  bypassSandboxEnabled,
 } from "./codex-core.mjs";
 import { appServerReviewTarget } from "./app-server.mjs";
 import { normalize, askedLine } from "./codex-events.mjs";
@@ -30,6 +31,9 @@ import { fetchModels, formatModels, knownModel, validateEffort, effortLevels } f
 import { readChat, writeChat, listChats, deleteChat, withChatLock, isValidSlug } from "./chat-store.mjs";
 import { readPrefs, writePrefs } from "./prefs.mjs";
 import { toolText, uiText } from "./i18n.mjs";
+import { CollaborationSession, collaborationTool } from "./collaboration.mjs";
+import { createCodexCollaborationRunner } from "./collaboration-codex.mjs";
+import { collaborationMessage } from "./i18n-collaboration.mjs";
 
 const T = toolText();
 // Ответы берутся на каждый вызов: язык задаётся окружением процесса.
@@ -41,6 +45,7 @@ const EFFORT_DESC = T.effort;
 const EFFORT_SET = effortLevels();
 
 const TOOLS = [
+  collaborationTool("codex", { efforts: EFFORT_SET }),
   {
     name: "codex_ask",
     description: T.ask_d,
@@ -307,7 +312,8 @@ async function handleTool(name, args, ctx = {}) {
 }
 
 async function dispatchTool(name, args, ctx = {}) {
-  if (CLI_TOOLS.has(name)) {
+  if (process.env.TANDEM_COLLABORATION_CHILD === "1") return err(collaborationMessage("nested"));
+  if (CLI_TOOLS.has(name) || (name === "codex_collaborate" && (!args.action || args.action === "turn"))) {
     const problem = await guard();
     if (problem) return err(problem);
   }
@@ -331,6 +337,23 @@ async function dispatchTool(name, args, ctx = {}) {
   if (asked) ctx?.notify?.(asked);
 
   switch (name) {
+    case "codex_collaborate": {
+      if ((!args.action || args.action === "turn") && bypassSandboxEnabled()) {
+        return err(collaborationMessage("bypass"));
+      }
+      const runner = createCodexCollaborationRunner(cwd, notifier(ctx));
+      const preferences = applyDefaults({}, cwd);
+      const defaults = {
+        model: preferences.model || envClean("TANDEM_MODEL"),
+        effort: preferences.effort || envClean("TANDEM_EFFORT"),
+      };
+      try {
+        const session = new CollaborationSession({ backend: "codex", cwd, runner, defaults });
+        return text(JSON.stringify(await session.handle(args, ctx), null, 2));
+      } catch (error) {
+        return err(error.message || String(error));
+      }
+    }
     case "codex_ask": {
       const waitMs = Math.max(10, Number(args.wait_seconds) || 90) * 1000;
       const r = await runJob(

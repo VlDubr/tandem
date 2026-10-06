@@ -306,6 +306,7 @@ export function reviewBackend() {
 }
 
 const SANDBOX_BY_MODE = {
+  collaborate: "read-only",
   ask: "read-only",
   review: "read-only",
   challenge: "read-only",
@@ -313,7 +314,7 @@ const SANDBOX_BY_MODE = {
   delegate: "workspace-write",
 };
 
-export function buildArgs({ mode, model, effort, cwd, sandbox, images = [], resume = null, reasoningSummary = null }) {
+export function buildArgs({ mode, model, effort, cwd, sandbox, images = [], resume = null, reasoningSummary = null, disabledMcpServers = null }) {
   const caps = capabilities();
   const args = ["exec"];
   // Продолжение разговора: `exec resume <uuid>` поднимает прежний тред.
@@ -329,6 +330,8 @@ export function buildArgs({ mode, model, effort, cwd, sandbox, images = [], resu
   // Включается только явной настройкой — Codex тогда выполняет команды без
   // изоляции, и это осознанный размен, а не значение по умолчанию.
   if (bypassSandboxEnabled() && caps.bypassSandbox) {
+    // Совместная сессия обязана оставаться read-only: обход здесь недопустим.
+    if (Array.isArray(disabledMcpServers)) throw new Error("Collaboration requires the Codex sandbox; disable bypass_sandbox.");
     args.push("--dangerously-bypass-approvals-and-sandbox");
     if (cwd && caps.cd && !resuming) args.push("--cd", cwd);
     const mb = model || envClean("TANDEM_MODEL");
@@ -366,6 +369,12 @@ export function buildArgs({ mode, model, effort, cwd, sandbox, images = [], resu
   if (rs) args.push("-c", `model_reasoning_summary="${rs}"`);
   if (caps.image) for (const img of images) args.push("--image", img);
 
+  // Изоляция совместной сессии: пустая TOML-таблица mcp_servers не очищает
+  // унаследованные серверы при слиянии слоёв, поэтому каждый выключается по имени.
+  if (Array.isArray(disabledMcpServers)) {
+    for (const flag of ["multi_agent", "plugins", "hooks", "apps"]) args.push("-c", `features.${flag}=false`);
+    for (const name of disabledMcpServers) args.push("-c", `mcp_servers.${JSON.stringify(name)}.enabled=false`);
+  }
   if (resuming) args.push(resume);
   args.push("-"); // промпт со stdin
   return args;
@@ -927,6 +936,7 @@ function startJobUnlocked(opts) {
       effort: opts.effort || envClean("TANDEM_EFFORT") || null,
       reasoningSummary: opts.reasoningSummary || envClean("TANDEM_REASONING_SUMMARY") || null,
       timeoutMs: Number(opts.jobTimeoutMs) || jobTimeoutMs(),
+      collaborationChild: opts.collaborationChild === true,
     })
   );
 

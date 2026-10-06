@@ -15,6 +15,8 @@ import { pluginVersion } from "../scripts/version.mjs";
 import { killTree, isWindows } from "../scripts/proc.mjs";
 import { ToolProxy, readExposed } from "./tool-proxy.mjs";
 import { toolText, prompt as claudePrompt, message } from "./i18n-claude.mjs";
+import { CollaborationSession, collaborationTool } from "../scripts/collaboration.mjs";
+import { collaborationMessage } from "../scripts/i18n-collaboration.mjs";
 
 const cleanEnv = (n) => {
   const v = process.env[n];
@@ -54,8 +56,12 @@ function stopAll() {
  * отмену и сериализовал все параллельные вызовы. Ровно этот дефект уже был
  * исправлен на стороне Codex, а на обратном направлении оставался.
  */
-function runClaude(prompt, { model, tools, denyTools, mode = "plan", timeoutMs = 600_000, signal } = {}) {
+function runClaude(prompt, { model, tools, denyTools, mode = "plan", timeoutMs = 600_000, signal, cwd, collaboration = false } = {}) {
   const args = ["-p", "--model", model || "sonnet", "--permission-mode", mode];
+  if (collaboration) {
+    args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
+    args.push("--settings", '{"disableAllHooks":true}');
+  }
   if (Array.isArray(tools)) args.push("--tools", tools.join(","));
   if (denyTools?.length) args.push("--disallowedTools", denyTools.join(","));
 
@@ -67,6 +73,8 @@ function runClaude(prompt, { model, tools, denyTools, mode = "plan", timeoutMs =
     try {
       child = spawn(CLAUDE_BIN, args, {
         stdio: ["pipe", "pipe", "pipe"],
+        cwd,
+        env: collaboration ? { ...process.env, TANDEM_COLLABORATION_CHILD: "1" } : process.env,
         // Своя группа процессов: Claude запускает подпроцессы, и убийство
         // одного лидера оставило бы их работать. На Windows группу заменяет
         // taskkill /T внутри killTree.
@@ -223,6 +231,7 @@ function resolveTools(requested, configured, write) {
 const tx = toolText();
 
 const OWN_TOOLS = [
+  collaborationTool("claude"),
   {
     name: "claude_ask",
     description: tx.ask_d,
@@ -279,7 +288,7 @@ const TASK_TOOL = {
 // ------------------------------------------------------------------- сборка
 
 const proxy = new ToolProxy();
-if (Object.keys(cfg.servers).length) await proxy.start();
+if (process.env.TANDEM_COLLABORATION_CHILD !== "1" && Object.keys(cfg.servers).length) await proxy.start();
 
 const TOOLS = [...OWN_TOOLS, ...(cfg.allowTask ? [TASK_TOOL] : []), ...proxy.toolDescriptors()];
 
@@ -290,6 +299,26 @@ if (proxy.errors.length) {
 // ------------------------------------------------------------------ обработка
 
 async function dispatch(name, args, ctx = {}) {
+  if (process.env.TANDEM_COLLABORATION_CHILD === "1") return fail(collaborationMessage("nested"));
+  if (name === "claude_collaborate") {
+    const cwd = cleanEnv("TANDEM_CWD") || cleanEnv("CLAUDE_PROJECT_DIR") || process.cwd();
+    const runner = {
+      start: (prompt, options, context) => runClaude(prompt, {
+        model: options.model,
+        cwd,
+        tools: ["Read", "Grep", "Glob"],
+        denyTools: WRITE_TOOLS,
+        signal: context.signal,
+        collaboration: true,
+      }),
+    };
+    try {
+      const session = new CollaborationSession({ backend: "claude", cwd, runner, defaults: { model: "sonnet" } });
+      return text(JSON.stringify(await session.handle(args, ctx), null, 2));
+    } catch (error) {
+      return fail(error.message || String(error));
+    }
+  }
   if (proxy.has(name)) {
     try {
       const res = await proxy.call(name, args);

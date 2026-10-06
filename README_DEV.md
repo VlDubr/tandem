@@ -28,7 +28,7 @@ tandem/
 │   ├── plugin.json          manifest, userConfig, defaultEnabled: false
 │   └── marketplace.json     single-plugin catalog, source: "."
 ├── .mcp.json                registers the codex and image servers
-├── commands/                14 slash commands (prompt templates)
+├── commands/                slash commands (including research, brainstorm, custom)
 ├── agents/                  gpt-delegate, gpt-advisor, gpt-chat, image-smith
 ├── hooks/hooks.json         SessionStart → preflight
 ├── .github/workflows/       tests.yml: matrix (Linux/Windows × Node 20.11/22) + strict validate
@@ -281,7 +281,15 @@ Covered: flag detection, terminal job states, exit code across restarts, descrip
 
 CI (`.github/workflows/tests.yml`) runs the suite on `ubuntu-latest` and `windows-latest` against Node 20.11 and 22, plus a separate `validate` job for `claude plugin validate . --strict`. The matrix exists because it caught real breakage: 28 tests that had never run on Windows were failing on Linux — English defaults compared against Russian substrings, a stub whose `process.exit` dropped buffered pipe output, and top-level `await` in `node -e`, which is parsed as CommonJS before Node 20.
 
-When adding functionality, add the test in the same file — it's deliberately a single file with no runner, to avoid pulling in dependencies.
+Collaboration tests live in `tests/collaboration.mjs` (state, budgets, phases, recovery) and `tests/collaboration-bridges.mjs` (both MCP entry points with portable fake CLIs). The regression entry point runs both through Node's built-in test runner, so the existing CI matrix covers them without dependencies. Run only these tests with `node --test tests/collaboration.mjs tests/collaboration-bridges.mjs`.
+
+### Collaboration protocol
+
+`CollaborationSession` in `scripts/collaboration.mjs` owns the common lifecycle; `scripts/i18n-collaboration.mjs` owns English/Russian descriptors and prompts. The Codex adapter reuses job workers, publishing the job ID before waiting; polling never starts another job. The Claude adapter uses the existing cancellable process runner with Read/Grep/Glob only. No native thread resume or autonomous orchestration is added.
+
+The state key hashes canonical cwd, backend, and validated session name. Atomic JSON snapshots live in the plugin data directory; the existing heartbeat lock serializes updates. A round is reserved before a model call; failure/cancellation still spends it. Each stage has six calls and monotonic mode-specific phases. Successful synthesis closes it; explicit extension requires a summary and caller attestation. Full transcripts remain local; prompts include only the summary, current stage, and explicitly bounded reply excerpts.
+
+`collaboration-codex.mjs` enumerates configured MCP servers and disables them individually: `mcp_servers={}` would merge rather than clear inherited tables. It also disables hooks, plugins, apps, and multi-agent features and rejects sandbox bypass. Worker environments carry a recursion guard, and both bridges reject nested calls. These controls do not redact secrets or authenticate a human's continuation request.
 
 ---
 
