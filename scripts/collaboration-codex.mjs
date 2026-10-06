@@ -39,11 +39,21 @@ export async function collaborationConfig(cwd) {
   return servers.map((server) => server.name);
 }
 
+// input_tokens у Codex включает кешированный ввод; для бюджета он вычитается,
+// чтобы метрика совпадала с Claude, где кеш учитывается отдельно.
+export function codexUsage(usage) {
+  if (!usage || !Number.isSafeInteger(usage.input_tokens) || !Number.isSafeInteger(usage.output_tokens)) return undefined;
+  const cached = Number.isSafeInteger(usage.cached_input_tokens) ? usage.cached_input_tokens : 0;
+  return { input: Math.max(0, usage.input_tokens - cached), output: Math.max(0, usage.output_tokens) };
+}
+
 export function createCodexCollaborationRunner(cwd, onEvent) {
   const result = (jobId) => {
     const r = jobResult(jobId);
     if (r.running) return { pending: true, jobId };
-    return r.ok ? { ok: true, output: r.output } : { ok: false, error: r.error };
+    if (!r.ok) return { ok: false, error: r.error };
+    const usage = codexUsage(r.usage);
+    return usage ? { ok: true, output: r.output, usage } : { ok: true, output: r.output };
   };
 
   const wait = async (jobId, seconds, ctx) => {

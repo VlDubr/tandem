@@ -59,6 +59,8 @@ function stopAll() {
 function runClaude(prompt, { model, tools, denyTools, mode = "plan", timeoutMs = 600_000, signal, cwd, collaboration = false } = {}) {
   const args = ["-p", "--model", model || "sonnet", "--permission-mode", mode];
   if (collaboration) {
+    // JSON-вывод нужен ради usage: без него бюджет токенов держался бы на оценке.
+    args.push("--output-format", "json");
     args.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
     args.push("--settings", '{"disableAllHooks":true}');
   }
@@ -298,19 +300,52 @@ if (proxy.errors.length) {
 
 // ------------------------------------------------------------------ обработка
 
+/**
+ * Ответ claude -p --output-format json: текст в result, расход в usage.
+ * Кешированный ввод не входит в бюджет: он повторно считается на каждом
+ * внутреннем шаге агента и сделал бы лимит бессмысленным.
+ */
+export function claudeCollaborationResult(r) {
+  if (!r.ok) return r;
+  let data;
+  try {
+    data = JSON.parse(r.output);
+  } catch {
+    return r; // старый CLI без JSON: текст как есть, расход оценивается
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) return r;
+  // Ошибка Claude Code (error_max_turns, error_during_execution) приходит без
+  // поля result и с кодом 0: её нельзя принять за успешный ход.
+  if (data.is_error === true) {
+    return { ok: false, error: (typeof data.result === "string" && data.result) || data.subtype || message("empty_response") };
+  }
+  if (typeof data.result !== "string") {
+    return data.type === "result" ? { ok: false, error: data.subtype || message("empty_response") } : r;
+  }
+  if (!data.result.trim()) return { ok: false, error: message("empty_response") };
+  // input_tokens не включает кеш; запись в кеш — это и есть основной промпт
+  // claude -p, поэтому она входит в бюджет. Повторно читаемый кеш — нет.
+  const u = data.usage;
+  const creation = Number.isSafeInteger(u?.cache_creation_input_tokens) ? u.cache_creation_input_tokens : 0;
+  const usage = u && Number.isSafeInteger(u.input_tokens) && Number.isSafeInteger(u.output_tokens)
+    ? { input: u.input_tokens + creation, output: u.output_tokens }
+    : undefined;
+  return usage ? { ok: true, output: data.result, usage } : { ok: true, output: data.result };
+}
+
 async function dispatch(name, args, ctx = {}) {
   if (process.env.TANDEM_COLLABORATION_CHILD === "1") return fail(collaborationMessage("nested"));
   if (name === "claude_collaborate") {
     const cwd = cleanEnv("TANDEM_CWD") || cleanEnv("CLAUDE_PROJECT_DIR") || process.cwd();
     const runner = {
-      start: (prompt, options, context) => runClaude(prompt, {
+      start: async (prompt, options, context) => claudeCollaborationResult(await runClaude(prompt, {
         model: options.model,
         cwd,
         tools: ["Read", "Grep", "Glob"],
         denyTools: WRITE_TOOLS,
         signal: context.signal,
         collaboration: true,
-      }),
+      })),
     };
     try {
       const session = new CollaborationSession({ backend: "claude", cwd, runner, defaults: { model: "sonnet" } });

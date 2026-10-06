@@ -32,11 +32,14 @@ if (args[0] === 'mcp') {
 const prompt = fs.readFileSync(0, 'utf8');
 fs.appendFileSync(process.env.COLLAB_TEST_LOG, JSON.stringify({args,prompt,cwd:process.cwd(),nested:process.env.TANDEM_COLLABORATION_CHILD})+'\\n');
 if (process.env.COLLAB_DELAY) await new Promise((resolve) => setTimeout(resolve, Number(process.env.COLLAB_DELAY)));
-if (args[0] === '-p') console.log('CLAUDE contribution');
+if (args[0] === '-p' && process.env.COLLAB_CLAUDE_MODE === 'error') console.log(JSON.stringify({type:'result',subtype:'error_max_turns',is_error:true}));
+else if (args[0] === '-p' && process.env.COLLAB_CLAUDE_MODE === 'empty') console.log(JSON.stringify({type:'result',is_error:false,result:'  '}));
+else if (args[0] === '-p' && args.includes('json')) console.log(JSON.stringify({type:'result',is_error:false,result:'CLAUDE contribution',usage:{input_tokens:10,output_tokens:5,cache_creation_input_tokens:100,cache_read_input_tokens:9000}}));
+else if (args[0] === '-p') console.log('CLAUDE contribution');
 else {
   console.log(JSON.stringify({type:'thread.started',thread_id:'11111111-1111-1111-1111-111111111111'}));
   console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'CODEX contribution'}}));
-  console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}}));
+  console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:12,cached_input_tokens:2,output_tokens:5}}));
 }
 `);
   fs.writeFileSync(preload, `
@@ -127,6 +130,8 @@ for (const backend of ["codex", "claude"]) {
     }));
     assert.equal(final.status, "complete");
     assert.equal(final.roundsUsed, 2);
+    assert.deepEqual(final.tokens, { used: backend === "codex" ? 30 : 230, max: null, estimated: false, remaining: null });
+    assert.equal(final.latest.reply, backend === "codex" ? "CODEX contribution" : "CLAUDE contribution");
     const calls = f.calls();
     assert.equal(calls.length, 2);
     assert.ok(calls[1].prompt.includes(backend === "codex" ? "CODEX contribution" : "CLAUDE contribution"));
@@ -145,6 +150,8 @@ for (const backend of ["codex", "claude"]) {
       assert.ok(calls[0].args.includes('{"disableAllHooks":true}'));
       assert.equal(calls[0].args[calls[0].args.indexOf("--tools") + 1], "Read,Grep,Glob");
       assert.equal(calls[0].args[calls[0].args.indexOf("--permission-mode") + 1], "plan");
+      assert.equal(calls[0].args[calls[0].args.indexOf("--output-format") + 1], "json");
+      assert.equal(calls[0].args[calls[0].args.indexOf("--output-format") + 1], "json");
     }
   });
 
@@ -192,3 +199,17 @@ test("codex: malformed MCP listing fails closed without leaking configuration", 
   assert.ok(!JSON.stringify(result).includes("sensitive-invalid-data"));
   assert.equal(f.calls().length, 0);
 });
+
+for (const mode of ["error", "empty"]) {
+  test(`claude: ${mode} JSON result fails the round instead of completing a phase`, async (t) => {
+    const f = fixture(t);
+    const client = await f.client("claude", { COLLAB_CLAUDE_MODE: mode });
+    const snapshot = payload(await client.call("claude_collaborate", { session: mode, mode: "compare", message: "Solve", commitment: "host answer" }));
+    assert.equal(snapshot.status, "active");
+    assert.equal(snapshot.phase, "solve");
+    assert.equal(snapshot.latest.reply, null);
+    assert.ok(snapshot.latest.error);
+    const next = await client.call("claude_collaborate", { session: mode, phase: "compare", message: "Compare" });
+    assert.equal(next.isError, true, "a failed solve must not satisfy the compare prerequisite");
+  });
+}

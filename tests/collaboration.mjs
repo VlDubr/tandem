@@ -518,7 +518,8 @@ test("live synchronous pending survives stale clock; orphan recovers after heart
   snapshot = await running;
   rewrite(snapshot, (state) => {
     const last = state.transcript.at(-1);
-    last.status = "pending"; last.output = null; last.finishedAt = null;
+    last.status = "pending"; last.output = null; last.finishedAt = null; last.usage = null;
+    state.tokensUsed = 0; state.tokensEstimated = false;
     state.pending = { id: last.id, jobId: null, heartbeatAt: realNow(), cancelRequested: false };
     state.status = "pending";
   });
@@ -555,7 +556,9 @@ test("invalid JSON and structurally corrupt state fail closed without resetting"
     "{broken", "null", "[]",
     JSON.stringify({ schemaVersion: 1 }),
     ...[
-      (s) => { s.schemaVersion = 2; },
+      (s) => { s.schemaVersion = 3; },
+      (s) => { s.tokensUsed += 1; },
+      (s) => { s.transcript[0].usage = { tokens: -1, estimated: false }; },
       (s) => { s.roundsUsed = 0; },
       (s) => { s.mode = "unknown"; },
       (s) => { s.mode = ["custom"]; },
@@ -661,7 +664,7 @@ test("full replies persist locally; returned and forwarded excerpts have marker,
   const lastPrompt = calls.start.at(-1).prompt;
   const data = payload(lastPrompt);
   assert.equal(data.turns.length, 5);
-  assert.equal(data.state_file, result.state_file);
+  assert.equal(data.state_file, undefined, "local path must not be sent to the second model");
   assert.ok(data.turns.every((entry) => entry.reply.length === 16000 && entry.truncated));
   assert.ok(lastPrompt.length < 170000);
   assert.equal(stateOf(result).transcript.at(-1).output, full);
@@ -745,4 +748,99 @@ test("forget requires confirmation, refuses pending rounds and removes only loca
   assert.equal(calls.start.length, 1);
   await service.handle(turn({ mode: "research" }));
   assert.equal((await service.handle(status())).mode, "research");
+});
+
+test("compare: commitment is required once, hidden during solve and revealed for comparison", async () => {
+  const { service, calls } = stub();
+  await assert.rejects(service.handle(turn({ mode: "compare" })), /requires commitment/);
+  await assert.rejects(service.handle(turn({ mode: "compare", message: "Solve: HOST ANSWER 42 here", commitment: "HOST ANSWER 42" })), /independently/);
+  assert.equal(calls.start.length, 0);
+  let snapshot = await service.handle(turn({ mode: "compare", message: "Solve the task", commitment: "HOST ANSWER 42" }));
+  assert.equal(snapshot.committed, true);
+  assert.equal(snapshot.phase, "solve");
+  assert.ok(!calls.start[0].prompt.includes("HOST ANSWER 42"));
+  assert.equal(payload(calls.start[0].prompt).host_commitment, undefined);
+  await assert.rejects(service.handle(turn({ phase: "compare", commitment: "changed answer" })), /once per stage/);
+  await assert.rejects(service.handle(turn({ phase: "synthesize" })), /Phase must move forward/);
+  snapshot = await service.handle(turn({ phase: "compare", message: "Compare both answers" }));
+  assert.equal(payload(calls.start[1].prompt).host_commitment, "HOST ANSWER 42");
+  const state = stateOf(snapshot);
+  assert.equal(state.commitments.length, 1);
+  assert.equal(state.commitments[0].text, "HOST ANSWER 42");
+  snapshot = await service.handle(turn({ phase: "synthesize", message: "Joint verdict" }));
+  assert.equal(snapshot.status, "complete");
+  await service.handle(extend());
+  await assert.rejects(service.handle(turn()), /requires commitment/);
+  await service.handle(turn({ message: "Solve again", commitment: "SECOND ANSWER" }));
+  assert.equal(stateOf(snapshot).commitments.length, 2);
+});
+
+test("compare: commitment is rejected in other modes", async () => {
+  const { service } = stub();
+  await service.handle(turn({ mode: "research" }));
+  await assert.rejects(service.handle(turn({ commitment: "answer" })), /only valid in compare/);
+});
+
+test("tokens: reported usage, estimates for missing usage, soft limit and extension", async () => {
+  let n = 0;
+  const { service, calls } = stub("claude", {
+    start: () => (++n === 1 ? { ok: true, output: "measured", usage: { input: 700, output: 300 } } : { ok: false, error: "boom" }),
+  });
+  let snapshot = await service.handle(turn({ mode: "research", max_tokens: 1200 }));
+  assert.deepEqual(snapshot.tokens, { used: 1000, max: 1200, estimated: false, remaining: 200 });
+  snapshot = await service.handle(turn());
+  assert.equal(snapshot.tokens.estimated, true);
+  assert.ok(snapshot.tokens.used >= 1000 + Math.ceil(calls.start[1].prompt.length / 3));
+  await assert.rejects(service.handle(turn()), /Token budget exhausted/);
+  assert.equal(calls.start.length, 2);
+  await assert.rejects(service.handle(turn({ max_tokens: 99999 })), /only through extend/);
+  await assert.rejects(service.handle(extend()), /Token budget exhausted/);
+  await assert.rejects(service.handle(extend({ max_tokens: 10 })), /Token budget exhausted/);
+  snapshot = await service.handle(extend({ max_tokens: 50_000 }));
+  assert.equal(snapshot.tokens.max, 50_000);
+  assert.equal((await service.handle(status())).status, "active");
+  await service.handle(turn());
+  assert.equal(calls.start.length, 3);
+  const listed = await service.handle({ action: "list" });
+  assert.equal(listed.sessions[0].maxTokens, 50_000);
+});
+
+test("tokens: no limit by default; cancelled rounds are charged by prompt estimate", async () => {
+  const gate = deferred();
+  const { service } = stub("claude", { start: () => gate.promise });
+  const running = service.handle(turn({ mode: "custom" }));
+  await delay(20);
+  const cancelled = await service.handle(cancel());
+  gate.resolve({ ok: true, output: "late" });
+  await running;
+  assert.equal(cancelled.tokens.max, null);
+  assert.equal(cancelled.tokens.remaining, null);
+  assert.ok(cancelled.tokens.used > 0);
+  assert.equal(cancelled.tokens.estimated, true);
+});
+
+test("schema v1 state is upgraded in memory and persisted as v2 on next write", async () => {
+  const { service } = stub();
+  const snapshot = await service.handle(turn({ mode: "research" }));
+  rewrite(snapshot, (state) => {
+    state.schemaVersion = 1;
+    for (const key of ["maxTokens", "tokensUsed", "tokensEstimated", "commitments"]) delete state[key];
+    for (const entry of state.transcript) { delete entry.promptChars; delete entry.usage; }
+  });
+  const raw = fs.readFileSync(snapshot.state_file, "utf8");
+  const read = await service.handle(status());
+  assert.equal(read.tokens.used, 0);
+  assert.equal(fs.readFileSync(snapshot.state_file, "utf8"), raw, "status must not rewrite the file");
+  await service.handle(turn());
+  const upgraded = stateOf(snapshot);
+  assert.equal(upgraded.schemaVersion, 2);
+  assert.equal(upgraded.transcript[0].usage, null);
+  assert.ok(upgraded.transcript[1].usage.tokens > 0);
+});
+
+test("compare: commitment leaking through creation context is rejected", async () => {
+  const { service, calls } = stub();
+  await assert.rejects(service.handle(turn({ mode: "compare", message: "Solve", context: "Background. HOST ANSWER 7", commitment: "HOST ANSWER 7" })), /independently/);
+  assert.equal(calls.start.length, 0);
+  await assert.rejects(service.handle(status()), /not found/);
 });

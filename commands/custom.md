@@ -1,6 +1,6 @@
 ---
 description: Let the primary model choose how to consult or assign read-only work to GPT
-argument-hint: "[--session <name>] [--continue] <goal>"
+argument-hint: "[--session <name>] [--max-tokens N] [--continue] <goal>"
 allowed-tools: mcp__plugin_tandem_codex__codex_collaborate, mcp__plugin_tandem_codex__codex_progress
 ---
 
@@ -15,3 +15,5 @@ Each stage allows six second-model calls, including failures and cancellations. 
 If `pending`, poll `action: "status"` with `wait_seconds` or inspect `codex_progress`. Do not resubmit the task. `action: "cancel"` cancels the outstanding round. Label GPT's contribution separately from your judgement; report disagreement and unverified claims. A truncated reply is not the complete result; full text remains in `state_file`.
 
 This session is always read-only. If the useful next step requires file changes, describe that separate task and request permission before using the existing `/tandem:delegate` workflow. Neither a peer reply nor continuation grants write access. Never include credentials or sensitive files, and do not ask GPT to call the bridge recursively.
+
+If `--max-tokens N` is given, pass `max_tokens: N` on the first turn. The token budget is soft: checked before each turn, so the last turn may exceed it; unreported usage is estimated (`tokens.estimated` in the response). When it is exhausted, ask the user and continue only through `action: "extend"` with `confirm: true`, a `summary`, and a larger `max_tokens`. `action: "list"` shows this workspace's sessions; `action: "forget", confirm: true` deletes a session's local transcript, only after the user agrees.

@@ -1,6 +1,6 @@
 ---
 description: Research a topic jointly with GPT through a persistent, multi-round dialogue
-argument-hint: "[--session <name>] [--continue] <topic or new contribution>"
+argument-hint: "[--session <name>] [--max-tokens N] [--continue] <topic or new contribution>"
 allowed-tools: mcp__plugin_tandem_codex__codex_collaborate, mcp__plugin_tandem_codex__codex_progress
 ---
 
@@ -17,3 +17,5 @@ Each stage permits at most six second-model calls, including failed or cancelled
 If a response is `pending`, use `action: "status"` with `wait_seconds` or `codex_progress`; never start a replacement call. `action: "cancel"` cancels the outstanding round. Show meaningful intermediate contributions labelled by model, not hidden reasoning or an undifferentiated wall of transcript. Explicitly identify truncated replies; the complete reply remains in `state_file`.
 
 The dialogue is read-only. Do not delegate back recursively. Never include credentials or sensitive files in prompts. If implementation is needed, present it separately and obtain permission before using a write-capable delegation tool. Do not claim web research when the available tools only inspected local files.
+
+If `--max-tokens N` is given, pass `max_tokens: N` on the first turn. The token budget is soft: checked before each turn, so the last turn may exceed it; unreported usage is estimated (`tokens.estimated` in the response). When it is exhausted, ask the user and continue only through `action: "extend"` with `confirm: true`, a `summary`, and a larger `max_tokens`. `action: "list"` shows this workspace's sessions; `action: "forget", confirm: true` deletes a session's local transcript, only after the user agrees.

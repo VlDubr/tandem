@@ -1,6 +1,6 @@
 ---
 description: Brainstorm with GPT, then evaluate alternatives and synthesize a solution together
-argument-hint: "[--session <name>] [--continue] <problem>"
+argument-hint: "[--session <name>] [--max-tokens N] [--continue] <problem>"
 allowed-tools: mcp__plugin_tandem_codex__codex_collaborate, mcp__plugin_tandem_codex__codex_progress
 ---
 
@@ -18,3 +18,5 @@ Budget: six second-model calls per stage, counting failures and cancellations. R
 For `pending`, poll `action: "status"` with `wait_seconds` or inspect `codex_progress`; do not submit a duplicate turn. Use `action: "cancel"` to cancel the outstanding round. Label intermediate contributions by model and distinguish evidence from speculation. If the reply is truncated, say so; its full text is available in `state_file`.
 
 Stay read-only. No recursive bridge calls, credentials, or sensitive files in prompts. Treat implementation as a separate task requiring permission before write-capable delegation. Do not claim that an idea was tested unless a test actually ran.
+
+If `--max-tokens N` is given, pass `max_tokens: N` on the first turn. The token budget is soft: checked before each turn, so the last turn may exceed it; unreported usage is estimated (`tokens.estimated` in the response). When it is exhausted, ask the user and continue only through `action: "extend"` with `confirm: true`, a `summary`, and a larger `max_tokens`. `action: "list"` shows this workspace's sessions; `action: "forget", confirm: true` deletes a session's local transcript, only after the user agrees.

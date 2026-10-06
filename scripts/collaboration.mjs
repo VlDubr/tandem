@@ -16,9 +16,18 @@ const PHASES = {
   research: ["explore", "evaluate", "synthesize"],
   brainstorm: ["generate", "evaluate", "synthesize"],
   custom: ["work", "evaluate", "synthesize"],
+  compare: ["solve", "compare", "synthesize"],
 };
+// Обязательные успешные фазы перед переходом: независимость решений и сравнение
+// не должны пропускаться.
+const PREREQUISITES = {
+  brainstorm: { evaluate: "generate", synthesize: "evaluate" },
+  compare: { compare: "solve", synthesize: "compare" },
+};
+const MAX_TOKENS = 100_000_000;
+const SCHEMA_VERSION = 2;
 const ACTIONS = ["turn", "status", "extend", "cancel", "list", "forget"];
-const FIELDS = ["action", "session", "mode", "phase", "message", "context", "summary", "confirm", "model", "effort", "wait_seconds"];
+const FIELDS = ["action", "session", "mode", "phase", "message", "context", "commitment", "summary", "confirm", "max_tokens", "model", "effort", "wait_seconds"];
 const active = new Map();
 const cancellations = new Map();
 const own = (value, key) => Object.hasOwn(value, key);
@@ -50,6 +59,8 @@ export function collaborationTool(backend, { efforts = effortLevels() } = {}) {
     phase: { type: "string", enum: [...new Set(Object.values(PHASES).flat())], description: labels.phase },
     message: string("message", 12000),
     context: string("context", 12000),
+    commitment: string("commitment", 12000),
+    max_tokens: { type: "integer", minimum: 1, maximum: MAX_TOKENS, description: labels.max_tokens },
     summary: string("summary", 16000),
     confirm: { type: "boolean", description: labels.confirm },
     model: string("model", 200),
@@ -76,14 +87,16 @@ function validateArgs(args, backend) {
   if (!isValidSlug(args.session)) invalid("session");
   if (own(args, "mode") && (typeof args.mode !== "string" || !own(PHASES, args.mode))) invalid("mode");
   if (own(args, "phase") && !Object.values(PHASES).some((phases) => phases.includes(args.phase))) invalid("phase");
-  for (const [key, max] of [["message", 12000], ["context", 12000], ["summary", 16000]]) {
+  for (const [key, max] of [["message", 12000], ["context", 12000], ["commitment", 12000], ["summary", 16000]]) {
     if (own(args, key) && !text(args[key], max)) invalid(key);
   }
   if (own(args, "model") && !metadata(args.model)) invalid("model");
   if (own(args, "effort") && (backend !== "codex" || !effortLevels().includes(args.effort))) invalid("effort");
   if (own(args, "wait_seconds") && (backend !== "codex" || typeof args.wait_seconds !== "number" || !Number.isFinite(args.wait_seconds) || args.wait_seconds < 0)) invalid("wait_seconds");
   if (own(args, "confirm") && typeof args.confirm !== "boolean") invalid("confirm");
-  if (action !== "turn" && ["message", "context", "phase"].some((key) => own(args, key))) invalid("turn-only fields");
+  if (own(args, "max_tokens") && (!Number.isSafeInteger(args.max_tokens) || args.max_tokens < 1 || args.max_tokens > MAX_TOKENS)) invalid("max_tokens");
+  if (own(args, "max_tokens") && !["turn", "extend"].includes(action)) invalid("max_tokens is for creation or extend");
+  if (action !== "turn" && ["message", "context", "phase", "commitment"].some((key) => own(args, key))) invalid("turn-only fields");
   if (!["turn", "status"].includes(action) && own(args, "wait_seconds")) invalid("wait_seconds");
   if (action !== "extend" && own(args, "summary")) invalid("extend-only fields");
   if (!["extend", "forget"].includes(action) && own(args, "confirm")) invalid("confirm is for extend or forget");
@@ -102,8 +115,42 @@ function excerpt(value) {
 
 function phaseAllowed(mode, current, next, successful) {
   const phases = PHASES[mode];
-  return phases.includes(next) && phases.indexOf(next) >= phases.indexOf(current) &&
-    !(mode === "brainstorm" && ((next === "evaluate" && !successful.has("generate")) || (next === "synthesize" && !successful.has("evaluate"))));
+  const required = PREREQUISITES[mode]?.[next];
+  return phases.includes(next) && phases.indexOf(next) >= phases.indexOf(current) && (!required || successful.has(required));
+}
+
+// Оценка расхода, когда CLI не сообщил usage: 3 символа на токен намеренно
+// завышает латиницу, чтобы не занижать кириллицу и служебный контекст.
+const estimate = (chars) => Math.ceil(chars / 3);
+const digest = (value) => createHash("sha256").update(value).digest("hex");
+
+function usageOf(result, promptChars) {
+  const u = result?.usage;
+  if (record(u) && Number.isSafeInteger(u.input) && u.input >= 0 && Number.isSafeInteger(u.output) && u.output >= 0) {
+    return { tokens: u.input + u.output, estimated: false };
+  }
+  const outputChars = typeof result?.output === "string" ? result.output.length : 0;
+  return { tokens: estimate(promptChars + outputChars), estimated: true };
+}
+
+// Состояние v1 переводится в v2 только в памяти: файл переписывается при
+// следующем сохранении под замком, чтение ничего не меняет на диске.
+function upgrade(state) {
+  if (!record(state) || state.schemaVersion !== 1) return state;
+  state.schemaVersion = SCHEMA_VERSION;
+  state.maxTokens = null;
+  state.tokensUsed = 0;
+  state.tokensEstimated = false;
+  state.commitments = [];
+  if (Array.isArray(state.transcript)) {
+    for (const entry of state.transcript) {
+      if (record(entry)) {
+        entry.promptChars = 0;
+        entry.usage = null;
+      }
+    }
+  }
+  return state;
 }
 
 function stageStatus(entries) {
@@ -188,6 +235,7 @@ export class CollaborationSession {
         sessions.push({
           session: state.session, mode: state.mode, stage: state.stage, status: state.status, phase: state.phase,
           roundsUsed: state.roundsUsed, roundsRemaining: LIMIT - state.roundsUsed,
+          tokensUsed: state.tokensUsed, maxTokens: state.maxTokens,
           updatedAt: new Date(state.updatedAt).toISOString(),
         });
       } catch {
@@ -216,8 +264,8 @@ export class CollaborationSession {
 
   #validateState(state, scope) {
     const fail = () => { throw new Error(T().corrupt(scope.file)); };
-    if (!exactKeys(state, ["schemaVersion", "scope", "cwd", "backend", "session", "mode", "model", "effort", "stage", "roundsUsed", "phase", "status", "context", "summary", "transcript", "extensions", "pending", "createdAt", "updatedAt"])) fail();
-    if (!record(state) || state.schemaVersion !== 1 || state.scope !== scope.hash || state.cwd !== this.cwd || state.backend !== this.backend || state.session !== scope.session || typeof state.mode !== "string" || !own(PHASES, state.mode)) fail();
+    if (!exactKeys(state, ["schemaVersion", "scope", "cwd", "backend", "session", "mode", "model", "effort", "stage", "roundsUsed", "phase", "status", "context", "summary", "transcript", "extensions", "pending", "maxTokens", "tokensUsed", "tokensEstimated", "commitments", "createdAt", "updatedAt"])) fail();
+    if (!record(state) || state.schemaVersion !== SCHEMA_VERSION || state.scope !== scope.hash || state.cwd !== this.cwd || state.backend !== this.backend || state.session !== scope.session || typeof state.mode !== "string" || !own(PHASES, state.mode)) fail();
     if (!(state.model === null || metadata(state.model)) || !(state.effort === null || (this.backend === "codex" && effortLevels().includes(state.effort)))) fail();
     if (!Number.isSafeInteger(state.stage) || state.stage < 1 || !time(state.createdAt) || !time(state.updatedAt) || state.updatedAt < state.createdAt) fail();
     if (!(state.context === null || text(state.context, 12000)) || !(state.summary === null || text(state.summary, 16000)) || !Array.isArray(state.transcript) || !Array.isArray(state.extensions) || state.extensions.length !== state.stage - 1) fail();
@@ -225,6 +273,16 @@ export class CollaborationSession {
       if (!exactKeys(extension, ["stage", "summary", "at"]) || extension.stage !== index + 2 || !text(extension.summary, 16000) || !time(extension.at)) fail();
     }
     if (state.summary !== (state.extensions.at(-1)?.summary ?? null)) fail();
+    if (!(state.maxTokens === null || (Number.isSafeInteger(state.maxTokens) && state.maxTokens >= 1 && state.maxTokens <= MAX_TOKENS))) fail();
+    if (!Number.isSafeInteger(state.tokensUsed) || state.tokensUsed < 0 || typeof state.tokensEstimated !== "boolean" || !Array.isArray(state.commitments)) fail();
+    if (state.mode !== "compare" && state.commitments.length) fail();
+    const committed = new Set();
+    for (const commitment of state.commitments) {
+      if (!exactKeys(commitment, ["stage", "text", "sha256", "at"]) || !Number.isSafeInteger(commitment.stage) || commitment.stage < 1 || commitment.stage > state.stage || committed.has(commitment.stage) || !text(commitment.text, 12000) || commitment.sha256 !== digest(commitment.text) || !time(commitment.at)) fail();
+      committed.add(commitment.stage);
+    }
+    let tokens = 0;
+    let estimatedAny = false;
     const ids = new Set();
     let offset = 0;
     let currentEntries = [];
@@ -235,7 +293,13 @@ export class CollaborationSession {
       let phase = PHASES[state.mode][0];
       while (offset < state.transcript.length && state.transcript[offset]?.stage === stage) {
         const entry = state.transcript[offset++];
-        if (!exactKeys(entry, ["id", "stage", "round", "phase", "message", "status", "output", "error", "startedAt", "finishedAt"])) fail();
+        if (!exactKeys(entry, ["id", "stage", "round", "phase", "message", "status", "output", "error", "startedAt", "finishedAt", "promptChars", "usage"])) fail();
+        if (!Number.isSafeInteger(entry.promptChars) || entry.promptChars < 0) fail();
+        if (!(entry.usage === null || (exactKeys(entry.usage, ["tokens", "estimated"]) && Number.isSafeInteger(entry.usage.tokens) && entry.usage.tokens >= 0 && typeof entry.usage.estimated === "boolean"))) fail();
+        if (entry.status === "pending" && entry.usage !== null) fail();
+        if (state.mode === "compare" && !committed.has(stage)) fail();
+        tokens += entry.usage?.tokens ?? 0;
+        estimatedAny ||= entry.usage?.estimated === true;
         if (!record(entry) || !text(entry.id, 80) || ids.has(entry.id) || entry.round !== entries.length + 1 || entry.round > LIMIT || !text(entry.message, 12000) || !time(entry.startedAt) || !["pending", "completed", "failed", "cancelled"].includes(entry.status)) fail();
         if (stageStatus(entries) !== "active" || !phaseAllowed(state.mode, phase, entry.phase, successful)) fail();
         ids.add(entry.id);
@@ -252,6 +316,7 @@ export class CollaborationSession {
       currentEntries = entries;
       currentPhase = phase;
     }
+    if (state.tokensUsed !== tokens || state.tokensEstimated !== estimatedAny) fail();
     if (offset !== state.transcript.length || state.roundsUsed !== currentEntries.length || state.phase !== currentPhase || state.status !== stageStatus(currentEntries)) fail();
     if (state.status === "pending") {
       if (!exactKeys(state.pending, ["id", "jobId", "heartbeatAt", "cancelRequested"]) || state.pending.id !== currentEntries.at(-1).id || !time(state.pending.heartbeatAt) || typeof state.pending.cancelRequested !== "boolean" || !(state.pending.jobId === null || (this.backend === "codex" && jobId(state.pending.jobId)))) fail();
@@ -268,7 +333,7 @@ export class CollaborationSession {
     }
     let state;
     try {
-      state = JSON.parse(raw);
+      state = upgrade(JSON.parse(raw));
       this.#validateState(state, scope);
     } catch {
       throw new Error(T().corrupt(scope.file));
@@ -293,10 +358,11 @@ export class CollaborationSession {
     if (!args.mode) invalid("mode required at creation");
     const now = Date.now();
     return {
-      schemaVersion: 1, scope: scope.hash, cwd: this.cwd, backend: this.backend, session: args.session,
-      mode: args.mode, model: args.model ?? this.defaults.model, effort: args.effort ?? this.defaults.effort,
+      scope: scope.hash, cwd: this.cwd, backend: this.backend, session: args.session,
+      schemaVersion: SCHEMA_VERSION, mode: args.mode, model: args.model ?? this.defaults.model, effort: args.effort ?? this.defaults.effort,
       stage: 1, roundsUsed: 0, phase: PHASES[args.mode][0], status: "active",
       context: args.context ?? null, summary: null, transcript: [], extensions: [], pending: null,
+      maxTokens: args.max_tokens ?? null, tokensUsed: 0, tokensEstimated: false, commitments: [],
       createdAt: now, updatedAt: now,
     };
   }
@@ -306,6 +372,8 @@ export class CollaborationSession {
       if (own(args, key) && args[key] !== state[key]) throw new Error(T().immutable(key));
     }
     if (own(args, "context")) throw new Error(T().contextLater);
+    if (args.action === "turn" && own(args, "max_tokens")) throw new Error(T().maxTokensLater);
+    if (own(args, "commitment") && state.mode !== "compare") throw new Error(T().commitmentMode);
     if (own(args, "phase") && !PHASES[state.mode].includes(args.phase)) throw new Error(T().phaseOrder);
   }
 
@@ -323,6 +391,9 @@ export class CollaborationSession {
       entry.error = result.error;
     }
     entry.finishedAt = Date.now();
+    entry.usage = usageOf(cancelled || state.pending.cancelRequested ? null : result, entry.promptChars);
+    state.tokensUsed += entry.usage.tokens;
+    state.tokensEstimated ||= entry.usage.estimated;
     state.pending = null;
     state.status = stageStatus(state.transcript.filter((turn) => turn.stage === state.stage));
   }
@@ -343,6 +414,11 @@ export class CollaborationSession {
       roundsUsed: state.roundsUsed, roundsRemaining: LIMIT - state.roundsUsed,
       status: state.status, phase: state.phase, mode: state.mode, model: state.model, effort: state.effort,
       pending: state.pending ? { jobId: state.pending.jobId } : null,
+      tokens: {
+        used: state.tokensUsed, max: state.maxTokens, estimated: state.tokensEstimated,
+        remaining: state.maxTokens === null ? null : Math.max(0, state.maxTokens - state.tokensUsed),
+      },
+      committed: state.mode === "compare" ? state.commitments.some((c) => c.stage === state.stage) : undefined,
       latest: { reply: reply.value, error: error.value, truncated: reply.truncated || error.truncated },
       state_file: scope.file,
     };
@@ -352,7 +428,6 @@ export class CollaborationSession {
     const strings = T();
     const payload = {
       session: state.session, mode: state.mode, phase: entry.phase, stage: state.stage,
-      state_file: scope.file,
       roundsUsed: state.roundsUsed, roundsRemaining: LIMIT - state.roundsUsed,
       ...(state.stage === 1 ? { context: state.context } : { summary: state.summary }),
       turns: state.transcript.filter((turn) => turn.stage === state.stage && turn.status === "completed").map((turn) => {
@@ -361,6 +436,11 @@ export class CollaborationSession {
       }),
       message: entry.message,
     };
+    // Независимость: зафиксированный ответ ведущей модели не уходит второй модели
+    // на этапе solve и раскрывается только для сравнения.
+    if (state.mode === "compare" && entry.phase !== "solve") {
+      payload.host_commitment = state.commitments.find((c) => c.stage === state.stage).text;
+    }
     return `${strings.safety}\n${strings.modes[state.mode]}\n${strings.phases[entry.phase]}\n\nDATA_JSON:\n${JSON.stringify(payload)}`;
   }
 
@@ -523,6 +603,9 @@ export class CollaborationSession {
       }
       if (args.action === "extend") {
         if (state.pending) throw new Error(T().pending);
+        const limit = args.max_tokens ?? state.maxTokens;
+        if (limit !== null && limit <= state.tokensUsed) throw new Error(T().tokensExhausted(state.tokensUsed, limit));
+        state.maxTokens = limit;
         state.stage++;
         state.roundsUsed = 0;
         state.phase = PHASES[state.mode][0];
@@ -534,22 +617,41 @@ export class CollaborationSession {
       }
       if (state.pending) return { snapshot: this.#snapshot(scope, state) };
       if (state.status !== "active") throw new Error(T().closed);
+      // Лимит мягкий: проверяется до хода, последний ход может его превысить.
+      if (state.maxTokens !== null && state.tokensUsed >= state.maxTokens) throw new Error(T().tokensExhausted(state.tokensUsed, state.maxTokens));
       const phase = args.phase ?? state.phase;
       const successful = new Set(state.transcript.filter((turn) => turn.stage === state.stage && turn.status === "completed").map((turn) => turn.phase));
       if (!phaseAllowed(state.mode, state.phase, phase, successful)) throw new Error(T().phaseOrder);
+      if (state.mode === "compare") {
+        const existing = state.commitments.find((c) => c.stage === state.stage);
+        if (own(args, "commitment")) {
+          // Ответ фиксируется один раз до первого вызова этапа: менять его после
+          // ответа второй модели значит подогнать решение под её результат.
+          if (existing || phase !== "solve" || state.transcript.some((turn) => turn.stage === state.stage)) throw new Error(T().commitmentOnce);
+        } else if (!existing) throw new Error(T().commitmentRequired);
+        const committed = existing?.text ?? args.commitment;
+        // На этапе solve вторая модель видит message и context (или summary после
+        // extend): дословный ответ ведущей не должен попасть ни в одно из них.
+        const visible = [args.message, state.stage === 1 ? state.context : state.summary].filter(Boolean);
+        if (phase === "solve" && visible.some((value) => value.includes(committed.trim()))) throw new Error(T().commitmentLeak);
+        if (!existing) state.commitments.push({ stage: state.stage, text: args.commitment, sha256: digest(args.commitment), at: Date.now() });
+      }
       aborted(ctx.signal);
       const entry = {
         id: randomUUID(), stage: state.stage, round: state.roundsUsed + 1, phase, message: args.message,
         status: "pending", output: null, error: null, startedAt: Date.now(), finishedAt: null,
+        promptChars: 0, usage: null,
       };
       state.transcript.push(entry);
       state.roundsUsed++;
       state.pending = { id: entry.id, jobId: null, heartbeatAt: Date.now(), cancelRequested: false };
       state.status = "pending";
+      const prompt = this.#prompt(scope, state, entry);
+      entry.promptChars = prompt.length;
       this.#save(scope, state);
       const controller = new AbortController();
       active.set(scope.file, { id: entry.id, controller });
-      return { kind: "start", id: entry.id, controller, prompt: this.#prompt(scope, state, entry), options: this.#options(state, args) };
+      return { kind: "start", id: entry.id, controller, prompt, options: this.#options(state, args) };
     });
     if (operation.snapshot) return operation.snapshot;
     if (operation.kind === "start") return this.#start(scope, operation, ctx);

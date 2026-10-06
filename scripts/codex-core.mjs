@@ -17,6 +17,7 @@ import {
   threadIdOf,
   hasStreamTags,
   streamText,
+  usageOf,
 } from "./codex-events.mjs";
 import { alive, killTree } from "./proc.mjs";
 import { prompt, uiText, coreText } from "./i18n.mjs";
@@ -1288,7 +1289,7 @@ export function jobResult(id) {
           .join("\n")
   );
 
-  if (job.status === "done") return { ok: true, job, output: out, stderr: noise, trail };
+  if (job.status === "done") return { ok: true, job, output: out, stderr: noise, trail, usage: usageOf(parsed.events) };
   if (job.status === "running") return { ok: false, job, running: true, trail, error: C().job_still_running };
 
   // Ненулевой код — всегда ошибка, даже если что-то успело напечататься:
