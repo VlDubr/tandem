@@ -5,7 +5,7 @@ const TEXT = {
     description:
       "Read-only collaboration with a second model. The IDE host model orchestrates BOTH directions; never run an autonomous cycle. At most 6 second-model calls per stage, including failed or cancelled attempts; continue only with extend, confirm:true and a nonempty summary. Research, brainstorm and custom are modes of one session mechanism; a different mode needs a new session. Generate ideas independently before comparing them; final synthesis must preserve disagreements and uncertainty. NEVER change files or recursively delegate through the bridge. File edits belong to existing separate delegation outside this session. confirm is the caller's attestation, NOT authentication of a human's approval. Codex status polls an existing job without spending another call; turn while pending never starts another call.",
     fields: {
-      action: "turn (default), status, extend or cancel. Cancel only the pending round; idle cancel does nothing.",
+      action: "turn (default), status, extend, cancel, list or forget. Cancel only the pending round; idle cancel does nothing. list needs no session and shows this workspace's sessions. forget deletes the local transcript and requires confirm:true.",
       session: "Session slug (1–49 ASCII letters, digits, dots, underscores or hyphens; start with a letter/digit; no '..'). Case-insensitive, scoped to canonical workspace and backend.",
       mode: "Required when creating a session, then immutable: research, brainstorm or custom.",
       phase: "Forward-only within a stage. Defaults: research=explore, brainstorm=generate, custom=work. All modes may evaluate then synthesize. Brainstorm evaluate requires successful generate; synthesize requires successful evaluate. Research/custom may synthesize immediately. Only successful turns advance the phase.",
@@ -39,6 +39,7 @@ const TEXT = {
     missing: "Collaboration session not found; create it with a turn and mode.",
     closed: "Stage is complete or exhausted; explicit extend with confirm:true and summary is required.",
     pending: "Cannot extend while a round is pending.",
+    pendingForget: "Cannot forget a session while a round is pending; cancel it first.",
     immutable: (field) => `${field} is immutable; use a new session to change it.`,
     contextLater: "context is creation-only; put later information in message.",
     phaseOrder: "Phase must move forward within the mode; brainstorm evaluation/synthesis requires successful generation/evaluation.",
@@ -48,7 +49,7 @@ const TEXT = {
     description:
       "Совместная работа со второй моделью только для чтения. Модель IDE-хоста управляет ОБОИМИ направлениями; автономный цикл запрещён. Максимум 6 вызовов второй модели на этап, включая ошибки и отмены; продолжение только через extend, confirm:true и непустой summary. research, brainstorm и custom — режимы единого механизма сессии; смена режима требует новой сессии. Сначала независимая генерация идей, затем сравнение; итоговый синтез сохраняет разногласия и неопределённость. НЕ изменять файлы и не делегировать рекурсивно через мост. Правки выполняются существующим отдельным делегированием вне сессии. confirm — заверение вызывающей стороны, НЕ проверка одобрения человеком. status Codex опрашивает существующее задание без нового вызова модели; turn при ожидании не запускает другой вызов.",
     fields: {
-      action: "turn (по умолчанию), status, extend или cancel. Отмена касается только ожидающего хода; без него ничего не меняет.",
+      action: "turn (по умолчанию), status, extend, cancel, list или forget. Отмена касается только ожидающего хода; без него ничего не меняет. list не требует session и показывает сессии этого каталога. forget удаляет локальную историю и требует confirm:true.",
       session: "Имя сессии: 1–49 латинских букв, цифр, точек, подчёркиваний или дефисов; начало — буква/цифра, '..' запрещено. Без учёта регистра, в области канонического каталога и бэкенда.",
       mode: "Обязателен при создании и неизменяем: research, brainstorm или custom.",
       phase: "Только вперёд в пределах этапа. По умолчанию: research=explore, brainstorm=generate, custom=work. Затем доступны evaluate и synthesize. Для brainstorm evaluate требует успешного generate, synthesize — успешного evaluate. research/custom допускают немедленный synthesize. Фазу продвигают только успешные ходы.",
@@ -82,6 +83,7 @@ const TEXT = {
     missing: "Сессия не найдена; создайте её через turn с указанием mode.",
     closed: "Этап завершён или исчерпан; требуется явный extend с confirm:true и summary.",
     pending: "Продление невозможно, пока ход ожидает завершения.",
+    pendingForget: "Нельзя удалить сессию, пока ход ожидает завершения; сначала отмените его.",
     immutable: (field) => `${field} неизменяем; для смены создайте новую сессию.`,
     contextLater: "context доступен только при создании; последующие сведения передавайте в message.",
     phaseOrder: "Фазы идут только вперёд в рамках режима; оценка/синтез brainstorm требуют успешной генерации/оценки.",

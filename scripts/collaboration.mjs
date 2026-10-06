@@ -17,7 +17,7 @@ const PHASES = {
   brainstorm: ["generate", "evaluate", "synthesize"],
   custom: ["work", "evaluate", "synthesize"],
 };
-const ACTIONS = ["turn", "status", "extend", "cancel"];
+const ACTIONS = ["turn", "status", "extend", "cancel", "list", "forget"];
 const FIELDS = ["action", "session", "mode", "phase", "message", "context", "summary", "confirm", "model", "effort", "wait_seconds"];
 const active = new Map();
 const cancellations = new Map();
@@ -61,15 +61,19 @@ export function collaborationTool(backend, { efforts = effortLevels() } = {}) {
   return {
     name: `${backend}_collaborate`,
     description: T().description,
-    inputSchema: { type: "object", properties, required: ["session"], additionalProperties: false },
+    inputSchema: { type: "object", properties, required: [], additionalProperties: false },
   };
 }
 
 function validateArgs(args, backend) {
   if (!record(args) || Reflect.ownKeys(args).some((key) => !FIELDS.includes(key))) invalid("unknown fields");
-  if (!isValidSlug(args.session)) invalid("session");
   const action = own(args, "action") ? args.action : "turn";
   if (!ACTIONS.includes(action)) invalid("action");
+  if (action === "list") {
+    if (Object.keys(args).some((key) => key !== "action")) invalid("list accepts no other fields");
+    return { action };
+  }
+  if (!isValidSlug(args.session)) invalid("session");
   if (own(args, "mode") && (typeof args.mode !== "string" || !own(PHASES, args.mode))) invalid("mode");
   if (own(args, "phase") && !Object.values(PHASES).some((phases) => phases.includes(args.phase))) invalid("phase");
   for (const [key, max] of [["message", 12000], ["context", 12000], ["summary", 16000]]) {
@@ -81,7 +85,9 @@ function validateArgs(args, backend) {
   if (own(args, "confirm") && typeof args.confirm !== "boolean") invalid("confirm");
   if (action !== "turn" && ["message", "context", "phase"].some((key) => own(args, key))) invalid("turn-only fields");
   if (!["turn", "status"].includes(action) && own(args, "wait_seconds")) invalid("wait_seconds");
-  if (action !== "extend" && ["confirm", "summary"].some((key) => own(args, key))) invalid("extend-only fields");
+  if (action !== "extend" && own(args, "summary")) invalid("extend-only fields");
+  if (!["extend", "forget"].includes(action) && own(args, "confirm")) invalid("confirm is for extend or forget");
+  if (action === "forget" && args.confirm !== true) invalid("forget requires confirm:true");
   if (action === "turn" && !own(args, "message")) invalid("message required");
   if (action === "extend" && (args.confirm !== true || !own(args, "summary"))) invalid("extend requires confirm:true and summary");
   return { ...args, action, session: args.session.toLowerCase() };
@@ -139,6 +145,11 @@ export class CollaborationSession {
 
   #scope(session) {
     const hash = createHash("sha256").update(JSON.stringify([this.cwd, this.backend, session])).digest("hex");
+    const dir = this.#storage();
+    return { hash, file: path.join(dir, `${hash}.json`), lock: `collab-${hash.slice(0, 40)}`, session };
+  }
+
+  #storage() {
     const base = path.dirname(dataDir());
     const outsideWorkspace = (directory) => {
       const relative = path.relative(this.cwd, fs.realpathSync(directory));
@@ -149,7 +160,42 @@ export class CollaborationSession {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     outsideWorkspace(dir);
     fs.chmodSync(dir, 0o700);
-    return { hash, file: path.join(dir, `${hash}.json`), lock: `collab-${hash.slice(0, 40)}`, session };
+    return dir;
+  }
+
+  // Битый или несовместимый файл не должен скрывать остальные сессии: он только
+  // попадает в skipped.
+  #list() {
+    const dir = this.#storage();
+    const sessions = [];
+    const skipped = [];
+    for (const name of fs.readdirSync(dir)) {
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+      const file = path.join(dir, name);
+      let raw;
+      try {
+        raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        skipped.push(file);
+        continue;
+      }
+      if (!record(raw) || raw.cwd !== this.cwd || raw.backend !== this.backend) continue;
+      try {
+        if (typeof raw.session !== "string") throw new Error();
+        const scope = this.#scope(raw.session);
+        if (scope.file !== file) throw new Error();
+        const state = this.#read(scope);
+        sessions.push({
+          session: state.session, mode: state.mode, stage: state.stage, status: state.status, phase: state.phase,
+          roundsUsed: state.roundsUsed, roundsRemaining: LIMIT - state.roundsUsed,
+          updatedAt: new Date(state.updatedAt).toISOString(),
+        });
+      } catch {
+        skipped.push(file);
+      }
+    }
+    sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return { backend: this.backend, sessions, skipped };
   }
 
   async #locked(scope, fn) {
@@ -445,6 +491,7 @@ export class CollaborationSession {
 
   async handle(input, ctx = {}) {
     const args = validateArgs(input, this.backend);
+    if (args.action === "list") return this.#list();
     const scope = this.#scope(args.session);
     if (args.action === "cancel") {
       const state = this.#read(scope);
@@ -463,6 +510,13 @@ export class CollaborationSession {
       }
       if (args.action === "cancel") {
         return state.pending ? { kind: "cancel", id: state.pending.id } : { snapshot: this.#snapshot(scope, state) };
+      }
+      if (args.action === "forget") {
+        // Ожидающий ход сначала отменяется явно: иначе его результат потерялся бы
+        // вместе с файлом, а задача Codex продолжила бы работу без учёта.
+        if (state.pending) throw new Error(T().pendingForget);
+        fs.unlinkSync(scope.file);
+        return { snapshot: { session: state.session, backend: this.backend, forgotten: true, state_file: scope.file } };
       }
       if (args.action === "status") {
         return state.pending?.jobId ? { kind: "poll", id: state.pending.id, jobId: state.pending.jobId, options: this.#options(state, args) } : { snapshot: this.#snapshot(scope, state) };

@@ -670,7 +670,7 @@ test("full replies persist locally; returned and forwarded excerpts have marker,
 test("localized schema and safety instructions precede untrusted JSON data", async () => {
   const en = collaborationTool("codex", { efforts: ["low", "high"] });
   assert.equal(en.name, "codex_collaborate");
-  assert.deepEqual(en.inputSchema.required, ["session"]);
+  assert.deepEqual(en.inputSchema.required, []);
   assert.equal(en.inputSchema.additionalProperties, false);
   assert.equal(en.inputSchema.properties.action.default, "turn");
   assert.deepEqual(en.inputSchema.properties.effort.enum, ["low", "high"]);
@@ -712,4 +712,37 @@ test("shared lock prevents duplicate reservation across simultaneous services", 
   const done = await first;
   assert.equal(done.roundsUsed, 1);
   assert.equal(stateOf(done).transcript.length, 1);
+});
+
+test("list shows only this workspace and backend, skips corrupt files", async () => {
+  const { service } = stub();
+  await service.handle(turn({ mode: "research" }));
+  await service.handle(turn({ session: "other", mode: "brainstorm" }));
+  const codex = stub("codex");
+  await codex.service.handle(turn({ session: "foreign", mode: "custom" }));
+  const broken = await service.handle(turn({ session: "broken", mode: "custom" }));
+  rewrite(broken, (state) => { state.roundsUsed = 99; });
+  const listed = await service.handle({ action: "list" });
+  assert.deepEqual(listed.sessions.map((s) => s.session).sort(), ["other", "sample"]);
+  assert.deepEqual(listed.skipped, [broken.state_file]);
+  assert.equal(listed.sessions.find((s) => s.session === "other").mode, "brainstorm");
+  await assert.rejects(service.handle({ action: "list", session: "sample" }), /list accepts no other fields/);
+});
+
+test("forget requires confirmation, refuses pending rounds and removes only local state", async () => {
+  const gate = deferred();
+  const { service, calls } = stub("claude", { start: () => gate.promise });
+  const running = service.handle(turn({ mode: "custom" }));
+  await delay(20);
+  await assert.rejects(service.handle({ action: "forget", session: "sample" }), /confirm:true/);
+  await assert.rejects(service.handle({ action: "forget", session: "sample", confirm: true }), /pending/);
+  gate.resolve({ ok: true, output: "done" });
+  const done = await running;
+  const forgotten = await service.handle({ action: "forget", session: "sample", confirm: true });
+  assert.equal(forgotten.forgotten, true);
+  assert.equal(fs.existsSync(done.state_file), false);
+  await assert.rejects(service.handle(status()), /not found/);
+  assert.equal(calls.start.length, 1);
+  await service.handle(turn({ mode: "research" }));
+  assert.equal((await service.handle(status())).mode, "research");
 });
