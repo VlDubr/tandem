@@ -2,12 +2,14 @@ import test, { after, afterEach, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
 import { CollaborationSession, collaborationTool } from "../scripts/collaboration.mjs";
 import { collaborationText } from "../scripts/i18n-collaboration.mjs";
 import { withChatLock } from "../scripts/chat-store.mjs";
 
-const root = fs.mkdtempSync(path.join(process.cwd(), ".collaboration-test-"));
+// Индексаторы проекта могут удерживать временные файлы и мешать rename на Windows.
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "tandem-collaboration-test-"));
 const oldData = process.env.CLAUDE_PLUGIN_DATA;
 const oldLang = process.env.TANDEM_LANG;
 let sequence = 0;

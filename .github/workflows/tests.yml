@@ -23,6 +23,9 @@ jobs:
       - name: Run regression tests
         run: node tests/regressions.mjs
 
+      - name: Run background notification tests
+        run: node tests/job-notify.mjs
+
   # Манифест от платформы не зависит — одного прогона достаточно, незачем
   # ставить Claude Code в каждую ячейку матрицы.
   validate:
