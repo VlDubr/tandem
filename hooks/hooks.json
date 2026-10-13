@@ -1,5 +1,18 @@
 {
   "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__.*__codex_(ask|chat|delegate|review|challenge|collaborate)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/job-notify.mjs\"",
+            "asyncRewake": true,
+            "timeout": 28920
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

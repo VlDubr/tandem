@@ -1096,7 +1096,7 @@ function reconcile(job) {
 // задачам: работающую или недавнюю трогать нельзя — за ней ещё придут.
 const RETENTION_MS = 7 * 24 * 60 * 60_000;
 const RETENTION_KEEP = 200;
-const JOB_EXTS = ["json", "out", "prompt", "spec", "code", "note", "cancel", "alive"];
+const JOB_EXTS = ["json", "out", "prompt", "spec", "code", "note", "cancel", "alive", "notified"];
 let sweptAt = 0;
 
 function sweepJobs(jobs) {
@@ -1142,6 +1142,44 @@ export function resolveJob(id, cwd) {
   if (!isValidJobId(id)) return null;
   const j = readJob(id);
   return j ? reconcile(j) : null;
+}
+
+/** Снимок для уведомлений: не меняет статус задачи и не останавливает процессы. */
+export function jobNotificationState(id) {
+  if (!isValidJobId(id)) return null;
+  const job = readJob(id);
+  if (!job) return null;
+  let timeoutMs;
+  try {
+    timeoutMs = JSON.parse(fs.readFileSync(jobPath(id, "spec"), "utf8")).timeoutMs;
+  } catch {}
+  const completedStatus = () => {
+    const code = readExitCode(id);
+    return code === null ? null : NOTE_STATUS[readNote(id)]?.[0] || (code === 0 ? "done" : "failed");
+  };
+  let status = job.status;
+  if (!TERMINAL.has(status)) {
+    // Воркер мог записать код и убрать метку жизни между двумя чтениями.
+    status = completedStatus() || (workerAlive(job) ? status : completedStatus() || "unknown");
+  }
+  return {
+    id: job.id,
+    status,
+    startedAt: job.startedAt,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : JOB_TIMEOUT_DEFAULT_MIN * 60_000,
+  };
+}
+
+/** Один сбой задачи уведомляет вызывающего один раз, даже при параллельных хуках. */
+export function claimJobNotification(id) {
+  if (!isValidJobId(id)) return false;
+  try {
+    fs.writeFileSync(jobPath(id, "notified"), "1", { flag: "wx", mode: FILE_MODE });
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
 }
 
 export function jobOutput(id, { tail = 0 } = {}) {

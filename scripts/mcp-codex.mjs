@@ -34,6 +34,7 @@ import { toolText, uiText } from "./i18n.mjs";
 import { CollaborationSession, collaborationTool } from "./collaboration.mjs";
 import { createCodexCollaborationRunner } from "./collaboration-codex.mjs";
 import { collaborationMessage } from "./i18n-collaboration.mjs";
+import { backgroundReply } from "./job-notify.mjs";
 
 const T = toolText();
 // Ответы берутся на каждый вызов: язык задаётся окружением процесса.
@@ -349,7 +350,10 @@ async function dispatchTool(name, args, ctx = {}) {
       };
       try {
         const session = new CollaborationSession({ backend: "codex", cwd, runner, defaults });
-        return text(JSON.stringify(await session.handle(args, ctx), null, 2));
+        const result = await session.handle(args, ctx);
+        return result.pending?.jobId
+          ? backgroundReply(result.pending.jobId, result)
+          : text(JSON.stringify(result, null, 2));
       } catch (error) {
         return err(error.message || String(error));
       }
@@ -363,7 +367,7 @@ async function dispatchTool(name, args, ctx = {}) {
       if (r.aborted) return text(U().cancelled(r.job.id));
       if (r.timedOut) {
         // Работа не перезапускается: тот же процесс продолжает идти в фоне.
-        return text(
+        return backgroundReply(r.job.id,
           `${U().timed_out(Math.round(waitMs / 1000), r.job.id)}\n\n` +
             `${renderTrail(jobTrail(r.job.id, { limit: 20 }), { asked })}\n\n` +
             U().follow_answer
@@ -410,7 +414,7 @@ async function dispatchTool(name, args, ctx = {}) {
 
           if (r.aborted) return text(U().cancelled_chat(r.job.id, slug));
           if (r.timedOut) {
-            return text(
+            return backgroundReply(r.job.id,
               `${U().chat_timed_out(Math.round(waitMs / 1000), r.job.id, slug)}\n\n` +
                 renderTrail(jobTrail(r.job.id, { limit: 20 }), { asked })
             );
@@ -554,13 +558,11 @@ async function dispatchTool(name, args, ctx = {}) {
       if (!background) {
         const r = await runJob(spec, { waitMs: 480_000, onEvent: notifier(ctx), signal: ctx.signal });
         if (r.aborted) return text(U().cancelled(r.job.id));
-        if (r.timedOut) return text(U().review_timed_out(r.job.id));
+        if (r.timedOut) return backgroundReply(r.job.id, U().review_timed_out(r.job.id));
         return r.ok ? text(renderRun(r.job.id, r.output, { asked })) : err(r.error);
       }
       const job = startJob(spec);
-      return text(
-        U().review_started(mode !== "review", job.id)
-      );
+      return backgroundReply(job.id, U().review_started(mode !== "review", job.id));
     }
 
     case "codex_delegate": {
@@ -570,14 +572,12 @@ async function dispatchTool(name, args, ctx = {}) {
       const waitMs = args.wait_seconds === undefined ? 120_000 : Math.max(0, Number(args.wait_seconds) || 0) * 1000;
       if (waitMs <= 0) {
         const job = startJob(spec);
-        return text(
-          U().delegated(job.id)
-        );
+        return backgroundReply(job.id, U().delegated(job.id));
       }
       const r = await runJob(spec, { waitMs, onEvent: notifier(ctx), signal: ctx.signal });
       if (r.aborted) return text(U().cancelled(r.job.id));
       if (r.timedOut) {
-        return text(
+        return backgroundReply(r.job.id,
           `${U().timed_out(Math.round(waitMs / 1000), r.job.id)}\n\n` +
             `${renderTrail(jobTrail(r.job.id, { limit: 20 }), { asked })}\n\n` +
             U().follow_result
