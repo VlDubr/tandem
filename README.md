@@ -103,6 +103,8 @@ The plugin emits this trail as `notifications/progress` while the call is still 
 
 If a synchronous `codex_ask` runs past its wait budget, it doesn't fail and nothing is lost — the very same job keeps running in the same process in the background, and you get its id plus everything the model managed to do so far. Cancelling the call in Claude stops Codex too.
 
+If a background job reaches `job_timeout_minutes` (30 minutes by default), fails, or loses its worker, a background `PostToolUse` hook notifies Claude. The notification includes the job id, the reason, and a `codex_result` call to retrieve the saved diagnostics. Successful completion and explicit cancellation do not wake Claude. This requires Claude Code with [`asyncRewake`](https://code.claude.com/docs/en/hooks#command-hook-fields) support and hooks enabled; restart the session after updating the plugin. Delivery lasts only while the session remains open: after it closes, including when `claude -p` exits, check `codex_status` or `codex_result`.
+
 One caveat: Codex emits reasoning *summaries*, not full chain-of-thought. With `reasoning_summary = auto` there may be no summaries at all — set `detailed` if you want a verbose trail.
 
 ### Talking to Codex models
